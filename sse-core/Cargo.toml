@@ -1,0 +1,34 @@
+[package]
+name = "sse-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.1"
+description = "A high-performance, zero-I/O, no_std compatible state-machine parser for Server-Sent Events (SSE)."
+readme = "./README.md"
+repository = "https://github.com/PizzasBear/sse-rs"
+license = "MIT OR Apache-2.0"
+
+keywords = ["eventsource", "no_std", "parser", "server-sent-events", "sse"]
+categories = ["network-programming", "no-std", "parsing"]
+
+[dependencies]
+bytes = { version = "1.11", default-features = false }
+fastrand = { version = "2.4", optional = true }
+futures-core = { version = "0.3", default-features = false, optional = true }
+memchr = { version = "2.8", default-features = false, features = ["alloc"] }
+pin-project-lite = { version = "0.2", optional = true }
+serde = { version = "1.0", default-features = false, features = [
+  "alloc",
+  "derive",
+  "rc"
+], optional = true }
+thiserror = { version = "2.0", default-features = false }
+
+[dev-dependencies]
+tokio-test = "0.4.5"
+
+[features]
+default = ["fastrand", "std", "stream"]
+fastrand = ["dep:fastrand", "std"]
+std = ["memchr/std", "thiserror/std"]
+stream = ["dep:futures-core", "dep:pin-project-lite"]
