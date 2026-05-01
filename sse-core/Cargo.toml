@@ -1,8 +1,8 @@
 [package]
 name = "sse-core"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85.1"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.79.0"
 description = "A high-performance, zero-I/O, no_std compatible state-machine parser for Server-Sent Events (SSE)."
 readme = "./README.md"
 repository = "https://github.com/PizzasBear/sse-rs"
@@ -25,6 +25,7 @@ serde = { version = "1.0", default-features = false, features = [
 thiserror = { version = "2.0", default-features = false }
 
 [dev-dependencies]
+tokio-stream = "0.1.18"
 tokio-test = "0.4.5"
 
 [features]

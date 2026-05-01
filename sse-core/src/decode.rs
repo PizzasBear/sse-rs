@@ -1,5 +1,5 @@
 use alloc::{borrow::Cow, string::String, sync::Arc, vec, vec::Vec};
-use core::{num::NonZeroUsize, str};
+use core::{fmt, num::NonZeroUsize, str};
 use thiserror::Error;
 
 use bytes::Buf;
@@ -30,10 +30,72 @@ pub enum SseEvent {
 /// Error indicating that a parsed field exceeded the maximum allowed buffer size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Error)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[error("Payload exceeded the allotted buffer size limit")]
+#[error("payload exceeded the allotted buffer size limit")]
 pub struct PayloadTooLargeError;
 
-#[derive(Debug, Clone, Copy, Default)]
+const MAX_DEBUG_SIZE: usize = 200;
+
+struct ShowBigStr<'a>(&'a str);
+
+impl fmt::Debug for ShowBigStr<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut end = self.0.len().min(MAX_DEBUG_SIZE);
+        while !self.0.is_char_boundary(end) {
+            end -= 1;
+        }
+        let s = &self.0[..end];
+
+        fmt::Debug::fmt(s, f)?;
+        if end < self.0.len() {
+            write!(f, "... ({} bytes total)", self.0.len())?;
+        }
+
+        Ok(())
+    }
+}
+
+struct ShowBigBuf<'a>(&'a [u8]);
+
+impl fmt::Debug for ShowBigBuf<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (buf, truncated) = match self.0.len() {
+            ..=MAX_DEBUG_SIZE => (self.0, false),
+            _ => (&self.0[..MAX_DEBUG_SIZE], true),
+        };
+
+        let mut chunks = buf.utf8_chunks().peekable();
+
+        f.write_str("\"")?;
+        while let Some(chunk) = chunks.next() {
+            fmt::Display::fmt(&chunk.valid().escape_debug(), f)?;
+
+            let invalid = chunk.invalid();
+            if invalid.is_empty() {
+                continue;
+            }
+
+            // If we truncated and this is the very last chunk, the invalid bytes
+            // are almost certainly just a sliced multi-byte UTF-8 character.
+            if truncated && chunks.peek().is_none() {
+                break;
+            }
+
+            for &byte in invalid {
+                write!(f, "\\x{byte:02X}")?;
+            }
+        }
+
+        if truncated {
+            write!(f, "\"... ({} bytes total)", self.0.len())?;
+        } else {
+            f.write_str("\"")?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
 struct FieldMode {
     len: u8,
     buf: [u8; 5],
@@ -64,6 +126,14 @@ impl FieldMode {
     }
 }
 
+impl fmt::Debug for FieldMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FieldMode")
+            .field(&ShowBigBuf(self.as_slice()))
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ValueMode {
     Data,
@@ -86,7 +156,7 @@ enum Mode {
 ///
 /// This decoder does not perform any I/O. It consumes bytes from a given buffer
 /// and yields parsed [`SseEvent`]s. It is suitable for `no_std` environments.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SseDecoder {
     mode: Mode,
     last_event_id: Option<Arc<str>>,
@@ -96,12 +166,6 @@ pub struct SseDecoder {
     data_buf: Vec<u8>,
     retry_buf: Option<u32>,
     max_payload_size: NonZeroUsize,
-}
-
-impl Default for SseDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl SseDecoder {
@@ -485,6 +549,33 @@ impl SseDecoder {
                 }
             }
         }
+    }
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for SseDecoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SseDecoder")
+            .field("mode", &self.mode)
+            .field(
+                "last_event_id",
+                &self.last_event_id.as_deref().map(ShowBigStr),
+            )
+            .field(
+                "staged_last_event_id",
+                &self.staged_last_event_id.as_deref().map(ShowBigStr),
+            )
+            .field("last_event_id_buf", &ShowBigBuf(&self.last_event_id_buf))
+            .field("event_buf", &ShowBigBuf(&self.event_buf))
+            .field("data_buf", &ShowBigBuf(&self.data_buf))
+            .field("retry_buf", &self.retry_buf)
+            .field("max_payload_size", &self.max_payload_size)
+            .finish()
     }
 }
 

@@ -67,6 +67,8 @@ impl SseRetryConfig {
             return None;
         }
 
+        assert!(self.min_sleep_ms <= self.max_backoff_ms);
+
         let reconnect_time_ms = reconnect_time_ms.max(self.min_sleep_ms) as f32;
         let mut sleep_ms =
             match self.backoff_multiplier.is_finite() && 1.0 <= self.backoff_multiplier {

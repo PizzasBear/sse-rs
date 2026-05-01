@@ -4,24 +4,21 @@ A high-performance, `no_std` compatible state-machine parser for Server-Sent
 Events (SSE).
 
 `sse-core` is designed to be the foundational parsing layer for SSE clients. It
-does not perform any network I/O. Instead, it provides a highly efficient,
-allocation-minimized state machine that consumes raw bytes and yields parsed SSE
-events.
+does not perform any network I/O. Instead, it provides a highly efficient state
+machine that consumes raw byte buffers and yields parsed SSE events.
 
 ## Features
 
 - **`no_std` Compatible:** Requires only the `alloc` crate, making it perfect
   for embedded environments or custom network stacks.
-- **Zero-I/O State Machine:** The `SseDecoder` operates strictly on byte buffers
-  (`bytes::Buf`), decoupling parsing from the transport layer.
-- **Async Stream Wrapper:** Includes a lightweight `SseStream` wrapper to easily
-  integrate with `futures-core::TryStream` (e.g., standard async network
-  streams).
-- **Memory Efficient:** Leverages `Cow` for event names to avoid allocating
-  strings for standard `"message"` events, and cleanly enforces configurable
-  maximum payload sizes to prevent memory exhaustion from malicious servers.
-- **Jittered Backoff:** Includes a customizable mathematical utility
-  (`SseRetryConfig`) for calculating exponential backoffs and reconnect delays.
+- **Zero-I/O State Machine:** Operates strictly on byte buffers (`bytes::Buf`),
+  cleanly decoupling parsing logic from the transport layer.
+- **Async Stream Wrapper:** Includes an optional `SseStream` wrapper to easily
+  integrate with standard async network streams (`futures-core::TryStream`).
+- **Memory Safe:** Enforces strict, configurable maximum payload sizes to
+  prevent memory exhaustion from malicious or misconfigured servers.
+- **Smart Backoff:** Includes a customizable utility (`SseRetryConfig`) for
+  calculating exponential backoffs and reconnect delays with jitter.
 
 ## Usage
 
@@ -66,6 +63,28 @@ while let Some(result) = stream.next().await {
 
 ## Feature Flags
 
-- `jitter` _(enabled by default)_: Includes randomized jitter calculations in
-  `SseRetryConfig` to prevent thundering herd problems on reconnects. Requires
-  the `std` library. Disable this for `no_std` usage.
+`sse-core` is highly configurable, allowing you to strip out async or standard
+library dependencies for constrained environments. By default, **all features
+are enabled**.
+
+- `std`: Enables standard library support. Disable this for `no_std`
+  environments. (note: the `alloc` crate is still required).
+- `stream`: Enables the `SseStream` wrapper for asynchronous byte streams.
+  Disable this if you only need the raw, synchronous `SseDecoder` state machine.
+- `fastrand`: Enables randomized jitter calculations in `SseRetryConfig` to
+  prevent thundering herd scenarios (requires `std`).
+- `serde`: Implements `serde`'s `Serialize` and `Deserialize` traits on common
+  types.
+
+### `no_std` Usage
+
+To use `sse-core` in a `no_std` environment (using only the raw state-machine
+parser), disable the default features in your `Cargo.toml`:
+
+```toml
+[dependencies]
+sse-core = { version = "0.1", default-features = false }
+
+# Or if you need async
+sse-core = { version = "0.1", default-features = false, features = ["stream"] }
+```

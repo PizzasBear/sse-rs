@@ -3,6 +3,7 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 
 use std::{
+    fmt,
     future::Future,
     num::NonZeroUsize,
     pin::Pin,
@@ -34,22 +35,22 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Error)]
 pub enum Error {
     /// The server responded with a non-200 HTTP status code.
-    #[error("Unexpected HTTP status code: {0}")]
+    #[error("unexpected HTTP status code: {0}")]
     Status(StatusCode),
     /// The [`RequestBuilder`] could not be cloned (e.g., it contains a streaming body).
-    #[error("Request builder could not be cloned (e.g., non-restartable body stream)")]
+    #[error("request builder could not be cloned (e.g., non-restartable body stream)")]
     UncloneableRequest,
     /// The server's response lacked the `text/event-stream` Content-Type.
-    #[error("Invalid response HTTP Content-Type")]
+    #[error("invalid response HTTP Content-Type")]
     InvalidContentType,
     /// The server's response did not contain a Content-Type header.
-    #[error("Response HTTP Content-Type missing")]
+    #[error("response HTTP Content-Type missing")]
     MissingContentType,
     /// The client exhausted all retry attempts without successfully reconnecting.
-    #[error("Couldn't reconnect to SSE server in {0} attempts: {1}")]
+    #[error("couldn't reconnect to SSE server in {0} attempts: {1}")]
     Timeout(u32, SseErrorEvent),
     /// The server sent an event payload that exceeded the configured buffer limit.
-    #[error("Server sent an oversized payload exceeding the allotted buffer")]
+    #[error("server sent an oversized payload exceeding the allotted buffer")]
     PayloadTooLarge(#[from] PayloadTooLargeError),
 }
 
@@ -73,19 +74,31 @@ enum State {
     Closed,
 }
 
+impl fmt::Debug for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            State::Disconnected => f.write_str("Disconnected"),
+            State::Connecting(_) => f.write_str("Connecting(_)"),
+            State::Open => f.write_str("Open"),
+            State::Sleeping(fut) => f.debug_tuple("Sleeping").field(fut).finish(),
+            State::Closed => f.write_str("Closed"),
+        }
+    }
+}
+
 /// Transient errors that cause the stream to drop and trigger an automatic reconnection.
 #[derive(Debug, Error)]
 pub enum SseErrorEvent {
     /// The server gracefully closed the TCP connection (EOF) while the stream was active.
-    #[error("Server cleanly closed the connection (EOF)")]
+    #[error("server cleanly closed the connection (EOF)")]
     Eof,
 
     /// The server responded with an HTTP status code designated as retryable (e.g., 502, 503).
-    #[error("Transient HTTP error: {0}")]
+    #[error("transient HTTP error: {0}")]
     Http(StatusCode),
 
     /// A network-level error occurred, such as a dropped socket, DNS failure, or read timeout.
-    #[error("Network or transport error: {0}")]
+    #[error("network or transport error: {0}")]
     Network(#[from] reqwest::Error),
 }
 
@@ -158,7 +171,7 @@ impl From<SseErrorEvent> for SseEvent {
 
 /// Error indicating that an [`SseEvent`] could not be converted into a [`MessageEvent`].
 #[derive(Debug, Error)]
-#[error("Couldn't convert Event::{} into a MessageEvent", match .0 {
+#[error("couldn't convert Event::{} into a MessageEvent", match .0 {
     SseEvent::Open => "Open",
     SseEvent::Message(_) => "Message",
     SseEvent::Error(_) => "Error"
@@ -196,6 +209,7 @@ impl TryFrom<SseEvent> for MessageEvent {
 ///     .build();
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct EventSourceBuilder {
     req: RequestBuilder,
     retry_config: SseRetryConfig,
@@ -308,6 +322,24 @@ pub struct EventSource {
     retry_transient_errors: bool,
     stream: SseStream<ByteStream>,
     state: State,
+}
+
+impl fmt::Debug for EventSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventSource")
+            .field("req", &self.req)
+            .field("reconnection_time_ms", &self.reconnection_time_ms)
+            .field("connection_attempt", &self.connection_attempt)
+            .field("retry_config", &self.retry_config)
+            .field("retry_transient_errors", &self.retry_transient_errors)
+            .field("state", &self.state)
+            .field(
+                "stream.last_event_id()",
+                &self.stream.last_event_id().map(|id| &**id),
+            )
+            .field("stream.is_closed()", &self.stream.is_closed())
+            .finish_non_exhaustive()
+    }
 }
 
 impl EventSource {

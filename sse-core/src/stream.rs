@@ -17,6 +17,7 @@ use crate::{PayloadTooLargeError, SseDecoder, SseEvent};
 
 pin_project! {
     /// An asynchronous stream wrapper that parses SSE events from an underlying byte stream.
+    #[derive(Debug, Clone, Default)]
     pub struct SseStream<T: TryStream> {
         #[pin]
         inner: Option<T>,
@@ -231,4 +232,70 @@ where
     fn is_terminated(&self) -> bool {
         self.is_closed()
     }
+}
+
+#[test]
+fn hard_parse() -> Result<(), PayloadTooLargeError> {
+    use crate::MessageEvent;
+    use std::slice;
+    use tokio_stream::StreamExt;
+
+    tokio_test::block_on(async {
+        // Source: https://github.com/jpopesculian/eventsource-stream/blob/v0.2.3/tests/eventsource-stream.rs
+        let bytes = "
+
+:
+
+event: my-event\r
+data:line1
+data: line2
+:
+id: my-id
+:should be ignored too\rretry:42
+retry:
+
+data:second
+
+";
+
+        let mut inner = tokio_test::stream_mock::StreamMockBuilder::new();
+        for b in bytes.as_bytes() {
+            inner = inner.next(Ok(slice::from_ref(b)));
+        }
+        inner = inner
+            .next(Err(()))
+            .next(Ok(b"data: hello\n\ndata:ignored\n"));
+
+        let id = Some("my-id".into());
+
+        let mut stream = SseStream::new(inner.build());
+        let events: Vec<_> = (&mut stream).collect().await;
+
+        assert_eq!(
+            events,
+            &[
+                Ok(SseEvent::Retry(42)),
+                Ok(SseEvent::Message(MessageEvent {
+                    event: "my-event".into(),
+                    data: "line1\nline2".into(),
+                    last_event_id: id.clone()
+                })),
+                Ok(SseEvent::Message(MessageEvent {
+                    event: "message".into(),
+                    data: "second".into(),
+                    last_event_id: id.clone()
+                })),
+                Err(SseStreamError::Inner(())),
+                Ok(SseEvent::Message(MessageEvent {
+                    event: "message".into(),
+                    data: "hello".into(),
+                    last_event_id: id.clone()
+                })),
+            ]
+        );
+
+        assert!(stream.is_closed());
+
+        Ok(())
+    })
 }
