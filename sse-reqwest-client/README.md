@@ -1,5 +1,8 @@
 # sse-reqwest-client
 
+[![Documentation](https://docs.rs/sse-reqwest-client/badge.svg)](https://docs.rs/sse-reqwest-client)
+[![Latest version](https://img.shields.io/crates/v/sse-reqwest-client.svg)](https://crates.io/crates/sse-reqwest-client)
+
 A robust, auto-reconnecting Server-Sent Events (SSE) client built on top of
 `reqwest`.
 

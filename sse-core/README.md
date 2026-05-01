@@ -1,5 +1,8 @@
 # sse-core
 
+[![Documentation](https://docs.rs/sse-core/badge.svg)](https://docs.rs/sse-core)
+[![Latest version](https://img.shields.io/crates/v/sse-core.svg)](https://crates.io/crates/sse-core)
+
 A high-performance, `no_std` compatible state-machine parser for Server-Sent
 Events (SSE).
 
