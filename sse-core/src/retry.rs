@@ -16,6 +16,24 @@ pub struct SseRetryConfig {
     pub jitter: bool,
 }
 
+#[cfg(not(feature = "std"))]
+fn pown(mut x: f32, mut n: u32) -> f32 {
+    let mut out = 1.0;
+    while 0 < n {
+        if n & 1 != 0 {
+            out *= x;
+        }
+        x *= x;
+        n /= 2;
+    }
+    out
+}
+
+#[cfg(feature = "std")]
+fn pown(x: f32, n: u32) -> f32 {
+    x.powi(n.min(i32::MAX as _) as _)
+}
+
 impl SseRetryConfig {
     /// Creates a new retry configuration with sensible defaults.
     ///
@@ -72,7 +90,7 @@ impl SseRetryConfig {
         let reconnect_time_ms = reconnect_time_ms.max(self.min_sleep_ms) as f32;
         let mut sleep_ms =
             match self.backoff_multiplier.is_finite() && 1.0 <= self.backoff_multiplier {
-                true => reconnect_time_ms * self.backoff_multiplier.powi(attempt as _),
+                true => reconnect_time_ms * pown(self.backoff_multiplier, attempt),
                 false => reconnect_time_ms,
             };
 

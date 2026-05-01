@@ -625,7 +625,7 @@ fn consume_until_newline(
 
 #[test]
 fn hard_parse() -> Result<(), PayloadTooLargeError> {
-    use std::slice;
+    use core::slice;
 
     // Source: https://github.com/jpopesculian/eventsource-stream/blob/v0.2.3/tests/eventsource-stream.rs
     let bytes = "
