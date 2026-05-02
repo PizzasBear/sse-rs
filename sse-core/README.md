@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut decoder = SseDecoder::new();
     let mut buffer = Bytes::from("data: hello world\n\n");
 
-    while let Some(event) = decoder.next(&mut buffer)? {
+    while let Some(event) = decoder.next(&mut buffer) {
         println!("Parsed event: {:?}", event);
     }
     Ok(())

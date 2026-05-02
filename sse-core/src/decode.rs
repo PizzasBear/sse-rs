@@ -166,6 +166,7 @@ pub struct SseDecoder {
     data_buf: Vec<u8>,
     retry_buf: Option<u32>,
     max_payload_size: NonZeroUsize,
+    corrupted: bool,
 }
 
 impl SseDecoder {
@@ -179,7 +180,7 @@ impl SseDecoder {
     /// let mut decoder = SseDecoder::new();
     /// let mut buf = Bytes::from("data: standard stream\n\n");
     ///
-    /// let event = decoder.next(&mut buf)?;
+    /// let event = decoder.next(&mut buf).transpose()?;
     /// assert!(event.is_some());
     /// # Ok(())
     /// # }
@@ -206,7 +207,10 @@ impl SseDecoder {
     /// let mut decoder = SseDecoder::with_limit(limit);
     ///
     /// let mut buf = Bytes::from("data: small payload\n\n");
-    /// let _event = decoder.next(&mut buf)?;
+    /// let Some(event) = decoder.next(&mut buf) else {
+    ///     panic!();
+    /// };
+    /// assert!(event.is_ok());
     /// # Ok(())
     /// # }
     /// ```
@@ -222,6 +226,7 @@ impl SseDecoder {
             data_buf: vec![],
             retry_buf: None,
             max_payload_size,
+            corrupted: false,
         }
     }
 
@@ -272,16 +277,36 @@ impl SseDecoder {
     #[inline]
     pub fn reconnect(&mut self) {
         self.mode = Mode::Bom { bytes_read: 0 };
+        self.clear_bufs();
+        self.corrupted = false;
+    }
+
+    fn mark_corrupted(&mut self) {
+        self.clear_bufs();
+        self.corrupted = true
+    }
+
+    #[inline]
+    fn clear_bufs(&mut self) {
         self.data_buf.clear();
+        self.event_buf.clear();
+        self.last_event_id_buf.clear();
+        self.staged_last_event_id = self.last_event_id.clone();
     }
 
     fn dispatch(&mut self, cr: bool) -> Option<SseEvent> {
-        self.last_event_id = self.staged_last_event_id.clone();
-
         self.mode = match cr {
             true => Mode::PostCr,
             false => Mode::Field(FieldMode::new()),
         };
+
+        if self.corrupted {
+            self.corrupted = false;
+            // bufs should be clear already
+            return None;
+        }
+
+        self.last_event_id = self.staged_last_event_id.clone();
 
         match self.data_buf.last() {
             Some(b'\n') => {
@@ -329,8 +354,8 @@ impl SseDecoder {
     /// let mut buffer = Bytes::from("data: hello\n\n");
     ///
     /// // Call next() in a loop to drain all available events
-    /// while let Some(event) = decoder.next(&mut buffer).unwrap() {
-    ///     println!("Received: {:?}", event);
+    /// while let Some(event) = decoder.next(&mut buffer) {
+    ///     println!("Received: {event:?}");
     /// }
     ///
     /// // When next() returns None, the decoder is waiting for more data.
@@ -341,7 +366,7 @@ impl SseDecoder {
     ///
     /// Returns a [`PayloadTooLargeError`] if a single field (like data or event name)
     /// exceeds the maximum payload size limit configured for this decoder.
-    pub fn next(&mut self, buf: &mut impl Buf) -> Result<Option<SseEvent>, PayloadTooLargeError> {
+    pub fn next(&mut self, buf: &mut impl Buf) -> Option<Result<SseEvent, PayloadTooLargeError>> {
         // # 9.2.5 Parsing an event stream
         //
         // stream        = [ bom ] *event
@@ -364,7 +389,7 @@ impl SseDecoder {
         loop {
             let chunk = buf.chunk();
             if chunk.is_empty() {
-                return Ok(None);
+                return None;
             }
 
             match &mut self.mode {
@@ -409,18 +434,18 @@ impl SseDecoder {
                     buf.advance(subchunk.len() + 1);
 
                     let value = match field.as_slice() {
-                        b"data" => ValueMode::Data,
-                        b"event" => {
+                        b"data" if !self.corrupted => ValueMode::Data,
+                        b"event" if !self.corrupted => {
                             self.event_buf.clear();
                             ValueMode::Event
+                        }
+                        b"id" if !self.corrupted => {
+                            self.last_event_id_buf.clear();
+                            ValueMode::Id
                         }
                         b"retry" => {
                             self.retry_buf = None;
                             ValueMode::Retry
-                        }
-                        b"id" => {
-                            self.last_event_id_buf.clear();
-                            ValueMode::Id
                         }
                         b"" => match b0 {
                             b':' => {
@@ -428,7 +453,7 @@ impl SseDecoder {
                                 continue;
                             }
                             b'\r' | b'\n' => match self.dispatch(b0 == b'\r') {
-                                Some(ev) => return Ok(Some(ev)),
+                                Some(ev) => return Some(Ok(ev)),
                                 None => continue,
                             },
                             _ => unreachable!(),
@@ -496,39 +521,56 @@ impl SseDecoder {
                     buf.advance(advanced);
 
                     if let (true, Some(retry_buf)) = (return_event, self.retry_buf) {
-                        return Ok(Some(SseEvent::Retry(retry_buf)));
+                        return Some(Ok(SseEvent::Retry(retry_buf)));
                     }
                 }
                 Mode::Value(ValueMode::Data) => {
-                    if consume_until_newline(
+                    match consume_until_newline(
                         &mut self.mode,
                         Some(&mut self.data_buf),
                         self.max_payload_size,
                         buf,
-                    )? {
-                        self.data_buf.push(b'\n');
+                    ) {
+                        Ok(true) => self.data_buf.push(b'\n'),
+                        Ok(false) => {}
+                        Err(err) => {
+                            self.mark_corrupted();
+                            return Some(Err(err));
+                        }
                     }
                 }
                 Mode::Value(ValueMode::Event) => {
-                    consume_until_newline(
+                    if let Err(err) = consume_until_newline(
                         &mut self.mode,
                         Some(&mut self.event_buf),
                         self.max_payload_size,
                         buf,
-                    )?;
+                    ) {
+                        self.mark_corrupted();
+                        return Some(Err(err));
+                    }
                 }
                 Mode::Value(ValueMode::Id) => {
-                    if consume_until_newline(
+                    match consume_until_newline(
                         &mut self.mode,
                         Some(&mut self.last_event_id_buf),
                         self.max_payload_size,
                         buf,
-                    )? && memchr(0, &self.last_event_id_buf).is_none()
-                    {
-                        self.staged_last_event_id = match &*self.last_event_id_buf {
-                            [] => None,
-                            buf => Some(String::from_utf8_lossy(buf).into()),
-                        };
+                    ) {
+                        Ok(true) => {
+                            if memchr(0, &self.last_event_id_buf).is_none() {
+                                self.staged_last_event_id = match &*self.last_event_id_buf {
+                                    [] => None,
+                                    buf => Some(String::from_utf8_lossy(buf).into()),
+                                };
+                            }
+                            self.last_event_id_buf.clear();
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            self.mark_corrupted();
+                            return Some(Err(err));
+                        }
                     }
                 }
                 Mode::Ignore => {
@@ -594,6 +636,7 @@ fn consume_until_newline(
         let Some(i) = memchr2(b'\r', b'\n', chunk) else {
             if let Some(out) = out.as_deref_mut() {
                 if max_size.get() < out.len() + chunk.len() {
+                    out.clear();
                     *mode = Mode::Ignore;
                     return Err(PayloadTooLargeError);
                 }
@@ -605,6 +648,7 @@ fn consume_until_newline(
 
         if let Some(out) = out {
             if max_size.get() < out.len() + i {
+                out.clear();
                 *mode = Mode::Ignore;
                 return Err(PayloadTooLargeError);
             }
@@ -649,7 +693,7 @@ data:ignored
 
     let events = bytes
         .bytes()
-        .filter_map(|b| decoder.next(&mut slice::from_ref(&b)).transpose())
+        .filter_map(|b| decoder.next(&mut slice::from_ref(&b)))
         .collect::<Result<Vec<_>, PayloadTooLargeError>>()?;
 
     let id = Some("my-id".into());
@@ -671,4 +715,105 @@ data:ignored
         ]
     );
     Ok(())
+}
+
+#[test]
+fn test_reconnect() {
+    let mut stream1: &[u8] = b"
+id: my-id
+
+event: my-event
+data:line1
+:
+data: line2
+id: ignored1
+";
+
+    let mut stream2: &[u8] = b"
+
+data: data
+
+id: final
+
+id: ignored2
+";
+
+    let my_id = Some("my-id".into());
+
+    let mut decoder = SseDecoder::new();
+
+    assert_eq!(decoder.next(&mut stream1), None);
+    assert_eq!(decoder.last_event_id(), my_id.as_ref());
+    assert!(stream1.is_empty());
+
+    decoder.reconnect();
+
+    // Check that the buffer was cleared
+    assert_eq!(
+        decoder.next(&mut stream2),
+        Some(Ok(SseEvent::Message(MessageEvent {
+            event: "message".into(),
+            data: "data".into(),
+            last_event_id: my_id,
+        }))),
+    );
+    assert_eq!(decoder.next(&mut stream2), None);
+    assert_eq!(decoder.last_event_id().map(|id| &**id), Some("final"));
+    assert!(stream2.is_empty());
+}
+
+#[test]
+fn test_limits() {
+    let mut stream: &[u8] = b"
+data: 0123456789
+id: my-id
+
+id: 01234567890
+data: thing
+event: ev
+
+data: mid
+
+event: jojo
+id: ignored
+data: 01234567890
+retry: 10
+
+event: final
+data:
+
+";
+
+    let my_id = Some("my-id".into());
+
+    let mut decoder = SseDecoder::with_limit(NonZeroUsize::new(10).unwrap());
+
+    assert_eq!(
+        decoder.next(&mut stream),
+        Some(Ok(SseEvent::Message(MessageEvent {
+            event: "message".into(),
+            data: "0123456789".into(),
+            last_event_id: my_id.clone(),
+        })))
+    );
+    assert_eq!(decoder.next(&mut stream), Some(Err(PayloadTooLargeError)));
+    assert_eq!(
+        decoder.next(&mut stream),
+        Some(Ok(SseEvent::Message(MessageEvent {
+            event: "message".into(),
+            data: "mid".into(),
+            last_event_id: my_id.clone()
+        })))
+    );
+    assert_eq!(decoder.next(&mut stream), Some(Err(PayloadTooLargeError)));
+    assert_eq!(decoder.next(&mut stream), Some(Ok(SseEvent::Retry(10))));
+    assert_eq!(
+        decoder.next(&mut stream),
+        Some(Ok(SseEvent::Message(MessageEvent {
+            event: "final".into(),
+            data: "".into(),
+            last_event_id: my_id.clone()
+        })))
+    );
+    assert!(stream.is_empty());
 }

@@ -49,8 +49,8 @@ fn bench_sync_decoder(c: &mut Criterion) {
             decoder.clear();
             let mut buf = payload.clone();
 
-            while let Ok(Some(event)) = decoder.next(&mut buf) {
-                black_box(event);
+            while let Some(event) = decoder.next(&mut buf) {
+                _ = black_box(event);
             }
         })
     });

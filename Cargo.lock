@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "sse-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "sse-reqwest-client"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-core",

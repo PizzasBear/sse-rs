@@ -2,14 +2,14 @@ use alloc::sync::Arc;
 use core::{
     pin::Pin,
     str,
-    task::{self, Poll, ready},
+    task::{self, ready, Poll},
 };
 use thiserror::Error;
 
 use bytes::Buf;
 use futures_core::{
-    TryStream,
     stream::{FusedStream, Stream},
+    TryStream,
 };
 use pin_project_lite::pin_project;
 
@@ -113,7 +113,8 @@ impl<T: TryStream> SseStream<T> {
     /// * To close the stream and completely **wipe** the session state, use [`close_and_clear()`](Self::close_and_clear).
     #[inline]
     pub fn close(&mut self) {
-        self.inner = None;
+        self.decoder.reconnect();
+        self.clear_bufs();
     }
 
     /// Disconnects the stream and completely purges the underlying parser's state.
@@ -128,7 +129,7 @@ impl<T: TryStream> SseStream<T> {
     #[inline]
     pub fn close_and_clear(&mut self) {
         self.decoder.clear();
-        self.close();
+        self.clear_bufs();
     }
 
     /// Disconnects the inner stream and explicitly overrides the underlying
@@ -144,21 +145,34 @@ impl<T: TryStream> SseStream<T> {
     #[inline]
     pub fn close_with_id(&mut self, id: Option<Arc<str>>) {
         self.decoder.reconnect_with_id(id);
-        self.close();
+        self.clear_bufs();
     }
 
     /// Attaches a new inner stream to resume processing events.
     ///
-    /// This method resets the underlying parser's buffers but retains the most
-    /// recently received `Last-Event-ID`. It is the standard way to recover from
-    /// a dropped network connection without missing any events.
+    /// This method resets the underlying parser's buffers but safely retains the most
+    /// recently parsed `Last-Event-ID`. It is the standard way to recover from
+    /// a dropped network connection, allowing you to resume exactly where you left off.
     ///
-    /// If you need to manually inject a saved `Last-Event-ID` (e.g., when recovering
-    /// an offline session from a database), use [`attach_with_id()`](Self::attach_with_id) instead.
+    /// * To attach a stream and **inject** a new ID, use [`attach_with_id()`](Self::attach_with_id).
+    /// * To attach a stream and completely **wipe** the session state, use [`clear_and_attach()`](Self::clear_and_attach).
     #[inline]
     pub fn attach(&mut self, inner: T) {
-        self.decoder.reconnect();
-        self.buf = None;
+        self.close();
+        self.inner = Some(inner);
+    }
+
+    /// Attaches a new inner stream and completely purges the underlying parser's state.
+    ///
+    /// This method is used when you want to reuse an existing `SseStream` allocation
+    /// for a completely fresh connection or a different server. It clears all internal
+    /// byte buffers and permanently drops the currently tracked `Last-Event-ID`.
+    ///
+    /// * To attach a stream and **keep** the current ID, use [`attach()`](Self::attach).
+    /// * To attach a stream and **inject** a new ID, use [`attach_with_id()`](Self::attach_with_id).
+    #[inline]
+    pub fn clear_and_attach(&mut self, inner: T) {
+        self.close_and_clear();
         self.inner = Some(inner);
     }
 
@@ -166,16 +180,21 @@ impl<T: TryStream> SseStream<T> {
     /// the `Last-Event-ID` in the underlying decoder.
     ///
     /// This method is primarily used when recovering an offline session where
-    /// you need to initialize the stream with a saved ID right as you provide
-    /// the new HTTP response stream.
+    /// you need to initialize the stream with a saved ID (e.g., from a local database)
+    /// right as you provide the new HTTP response stream.
     ///
-    /// If you just want to resume a dropped stream using the ID that the decoder
-    /// has already tracked automatically, use [`attach()`](Self::attach).
+    /// * To attach a stream and **keep** the current ID, use [`attach()`](Self::attach).
+    /// * To attach a stream and completely **wipe** the session state, use [`clear_and_attach()`](Self::clear_and_attach).
     #[inline]
     pub fn attach_with_id(&mut self, inner: T, id: Option<Arc<str>>) {
-        self.decoder.reconnect_with_id(id);
-        self.buf = None;
+        self.close_with_id(id);
         self.inner = Some(inner);
+    }
+
+    #[inline]
+    fn clear_bufs(&mut self) {
+        self.inner = None;
+        self.buf = None;
     }
 }
 
@@ -209,7 +228,7 @@ where
 
         loop {
             if let Some(event) = (slf.buf.as_mut())
-                .and_then(|buf| slf.decoder.next(buf).transpose())
+                .and_then(|buf| slf.decoder.next(buf))
                 .transpose()
                 .map_err(SseStreamError::PayloadTooLarge)?
             {
