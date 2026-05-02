@@ -15,6 +15,9 @@ categories = [
   "web-programming::http-client"
 ]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 bytes = { version = "1.11" }
 futures-core = { version = "0.3" }

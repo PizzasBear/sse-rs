@@ -11,6 +11,9 @@ license = "MIT OR Apache-2.0"
 keywords = ["eventsource", "no_std", "parser", "server-sent-events", "sse"]
 categories = ["network-programming", "no-std", "parsing"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [[bench]]
 harness = false
 name = "bench"
