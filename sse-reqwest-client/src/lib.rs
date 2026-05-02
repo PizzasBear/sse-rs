@@ -14,9 +14,9 @@ use std::{
 
 use bytes::Bytes;
 use futures_core::stream::Stream;
-use reqwest::{RequestBuilder, StatusCode};
+use reqwest::{RequestBuilder, StatusCode, header::HeaderValue};
 use thiserror::Error;
-use tokio::time::{Sleep, sleep};
+use tokio::time::{Instant, Sleep, sleep};
 
 pub use sse_core::SseRetryConfig;
 use sse_core::{
@@ -52,6 +52,10 @@ pub enum Error {
     /// The server sent an event payload that exceeded the configured buffer limit.
     #[error("server sent an oversized payload exceeding the allotted buffer")]
     PayloadTooLarge(#[from] PayloadTooLargeError),
+    /// The `Last-Event-ID` provided by the server contains bytes that cannot be
+    /// safely converted into a valid HTTP header.
+    #[error("Last-Event-ID cannot be converted to a valid HTTP header: {0}")]
+    InvalidLastEventId(reqwest::header::InvalidHeaderValue),
 }
 
 /// The connection state mapping to the JavaScript [`EventSource`](https://developer.mozilla.org/en-US/docs/Web/API/EventSource) API [`readyState`](https://developer.mozilla.org/en-US/docs/Web/API/EventSource/readyState).
@@ -217,6 +221,7 @@ pub struct EventSourceBuilder {
     max_payload_size: Option<NonZeroUsize>,
     last_event_id: Option<Arc<str>>,
     retry_transient_errors: bool,
+    successful_connection_threshold: Duration,
 }
 
 impl EventSourceBuilder {
@@ -230,6 +235,7 @@ impl EventSourceBuilder {
             max_payload_size: None, // use default
             last_event_id: None,
             retry_transient_errors: false,
+            successful_connection_threshold: Duration::from_secs(5),
         }
     }
 
@@ -292,6 +298,15 @@ impl EventSourceBuilder {
         self
     }
 
+    /// Sets the minimum duration a connection must remain open to be considered "successful"
+    /// and reset the exponential backoff counter. Defaults to 5 seconds.
+    #[inline]
+    #[must_use]
+    pub fn successful_connection_threshold(mut self, threshold: Duration) -> Self {
+        self.successful_connection_threshold = threshold;
+        self
+    }
+
     /// Consumes the builder and returns the configured [`EventSource`].
     #[must_use]
     pub fn build(self) -> EventSource {
@@ -302,11 +317,15 @@ impl EventSourceBuilder {
         decoder.reconnect_with_id(self.last_event_id);
 
         EventSource {
-            req: self.req,
+            req: (self.req)
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .header(reqwest::header::CACHE_CONTROL, "no-store"),
             reconnection_time_ms: self.reconnection_time_ms,
             connection_attempt: 0,
+            connected_since: None,
             retry_config: self.retry_config,
             retry_transient_errors: self.retry_transient_errors,
+            successful_connection_threshold: self.successful_connection_threshold,
             stream: SseStream::with_decoder(decoder),
             state: State::Disconnected,
         }
@@ -318,8 +337,10 @@ pub struct EventSource {
     req: RequestBuilder,
     reconnection_time_ms: u32,
     connection_attempt: u32,
+    connected_since: Option<Instant>,
     retry_config: SseRetryConfig,
     retry_transient_errors: bool,
+    successful_connection_threshold: Duration,
     stream: SseStream<ByteStream>,
     state: State,
 }
@@ -452,13 +473,18 @@ impl EventSource {
     /// See [force_reconnect()](Self::force_reconnect) for more info.
     #[inline]
     pub fn force_reconnect_with_id(&mut self, id: Option<Arc<str>>) {
-        self.stream.close();
+        self.stream.close_with_id(id);
         self.connection_attempt = 0;
         self.state = State::Disconnected;
-        self.stream.close_with_id(id)
     }
 
     fn go_to_sleep(&mut self, cause: SseErrorEvent) -> Result<SseEvent> {
+        if let Some(connected_since) = self.connected_since.take() {
+            if self.successful_connection_threshold <= connected_since.elapsed() {
+                self.connection_attempt = 0;
+            }
+        }
+
         let wait_dur = (self.retry_config)
             .calculate_backoff(self.reconnection_time_ms, self.connection_attempt);
         self.connection_attempt += 1;
@@ -485,14 +511,17 @@ impl Stream for EventSource {
                         slf.close();
                         return Poll::Ready(Some(Err(Error::UncloneableRequest)));
                     };
-                    req = req
-                        .header(reqwest::header::ACCEPT, "text/event-stream")
-                        .header(reqwest::header::CACHE_CONTROL, "no-store");
 
                     // TODO: Maybe we should error if the provided RequestBuilder already had a
                     //       Last-Event-ID header.
                     if let Some(last_event_id) = slf.stream.last_event_id() {
-                        req = req.header("Last-Event-ID", &**last_event_id);
+                        match HeaderValue::from_str(last_event_id) {
+                            Ok(val) => req = req.header("Last-Event-ID", val),
+                            Err(err) => {
+                                slf.close();
+                                return Poll::Ready(Some(Err(Error::InvalidLastEventId(err))));
+                            }
+                        }
                     }
 
                     let fut = Box::pin(req.send());
@@ -545,7 +574,7 @@ impl Stream for EventSource {
                         }
 
                         slf.state = State::Open;
-                        slf.connection_attempt = 0;
+                        slf.connected_since = Some(Instant::now());
                         slf.stream.attach(Box::pin(res.bytes_stream()));
 
                         return Poll::Ready(Some(Ok(SseEvent::Open)));

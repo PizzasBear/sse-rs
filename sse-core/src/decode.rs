@@ -671,8 +671,8 @@ fn consume_until_newline(
 fn hard_parse() -> Result<(), PayloadTooLargeError> {
     use core::slice;
 
-    // Source: https://github.com/jpopesculian/eventsource-stream/blob/v0.2.3/tests/eventsource-stream.rs
-    let bytes = "
+    // Based on https://github.com/jpopesculian/eventsource-stream/blob/v0.2.3/tests/eventsource-stream.rs
+    let bytes = "\u{FEFF}data: x
 
 :
 
@@ -701,6 +701,11 @@ data:ignored
     assert_eq!(
         events,
         &[
+            SseEvent::Message(MessageEvent {
+                event: "message".into(),
+                data: "x".into(),
+                last_event_id: None
+            }),
             SseEvent::Retry(42),
             SseEvent::Message(MessageEvent {
                 event: "my-event".into(),
