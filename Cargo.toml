@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["sse-core", "sse-reqwest-client"]
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1

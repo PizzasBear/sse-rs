@@ -11,6 +11,10 @@ license = "MIT OR Apache-2.0"
 keywords = ["eventsource", "no_std", "parser", "server-sent-events", "sse"]
 categories = ["network-programming", "no-std", "parsing"]
 
+[[bench]]
+harness = false
+name = "bench"
+
 [dependencies]
 bytes = { version = "1.11", default-features = false }
 fastrand = { version = "2.4", optional = true }
@@ -25,6 +29,9 @@ serde = { version = "1.0", default-features = false, features = [
 thiserror = { version = "2.0", default-features = false }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+eventsource-stream = "0.2.3"
+tokio = { version = "1.52.1", features = ["macros", "rt"] }
 tokio-stream = "0.1.18"
 tokio-test = "0.4.5"
 

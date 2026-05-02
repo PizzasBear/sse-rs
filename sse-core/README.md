@@ -64,20 +64,49 @@ while let Some(result) = stream.next().await {
 }
 ```
 
+## Performance
+
+`sse-core` is built from the ground up for zero-copy, zero-allocation parsing
+where possible. By relying on `bytes::Buf`, the state machine advances an
+internal cursor rather than shifting memory or eagerly allocating strings.
+
+This architecture provides massive performance gains, particularly when
+processing heavily fragmented network streams or large data payloads.
+
+The benchmarks were ran with realistic network fragmentation across standard
+1460-byte TCP packet boundaries unless said otherwise.
+
+| Benchmark Scenario                                 | `sse-core`      | `eventsource-stream` | Delta             |
+| :------------------------------------------------- | :-------------- | :------------------- | :---------------- |
+| **Large Events (40KiB)**                           | **~3.52 GiB/s** | ~83.7 MiB/s          | _~42x Faster_     |
+| **Small Events (9B)**                              | **~345 MiB/s**  | ~120 MiB/s           | _~2.8x Faster_    |
+| **Keepalives**                                     | **~531 MiB/s**  | ~158 MiB/s           | _~3.4x Faster_    |
+| **High Fragmentation (4KiB data, 10-byte chunks)** | **~503 MiB/s**  | ~5.4 MiB/s           | _**~93x Faster**_ |
+
+These benchmarks were run using `cargo bench` on a Ryzen 5900x Linux PC.
+
+Because micro-benchmarks operating at sub-millisecond speeds are highly
+sensitive to
+[code alignment](https://www.bazhenov.me/posts/2024-02-performance-roulette/)
+and instruction cache thrashing, these results represent the stabilized metrics.
+To eliminate layout-induced variance and ensure reproducible results, the
+benchmarks were compiled using Fat LTO alongside explicit LLVM alignment flags:
+`RUSTFLAGS="-C llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=6"`
+
 ## Feature Flags
 
 `sse-core` is highly configurable, allowing you to strip out async or standard
-library dependencies for constrained environments. By default, **all features
-are enabled**.
+library dependencies for constrained environments.
 
-- `std`: Enables standard library support. Disable this for `no_std`
-  environments. (note: the `alloc` crate is still required).
-- `stream`: Enables the `SseStream` wrapper for asynchronous byte streams.
-  Disable this if you only need the raw, synchronous `SseDecoder` state machine.
-- `fastrand`: Enables randomized jitter calculations in `SseRetryConfig` to
-  prevent thundering herd scenarios (requires `std`).
-- `serde`: Implements `serde`'s `Serialize` and `Deserialize` traits on common
-  types.
+- **`std` (default):** Enables standard library support. Disable this for
+  `no_std` environments. (note: the `alloc` crate is still required).
+- **`stream` (default):** Enables the `SseStream` wrapper for asynchronous byte
+  streams. Disable this if you only need the raw, synchronous `SseDecoder` state
+  machine.
+- **`fastrand` (default):** Uses the `fastrand` crate to generate the random
+  jitter value used to prevent thundering herd scenarios (requires `std`).
+- **`serde`:** Implements `serde`'s `Serialize` and `Deserialize` traits on
+  common types.
 
 ### `no_std` Usage
 
@@ -86,8 +115,8 @@ parser), disable the default features in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sse-core = { version = "0.1", default-features = false }
-
-# Or if you need async
 sse-core = { version = "0.1", default-features = false, features = ["stream"] }
+
+# Or if you don't need async
+sse-core = { version = "0.1", default-features = false }
 ```
