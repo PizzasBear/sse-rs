@@ -115,8 +115,8 @@ parser), disable the default features in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sse-core = { version = "0.1", default-features = false, features = ["stream"] }
+sse-core = { version = "0.2", default-features = false, features = ["stream"] }
 
 # Or if you don't need async
-sse-core = { version = "0.1", default-features = false }
+sse-core = { version = "0.2", default-features = false }
 ```

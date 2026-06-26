@@ -32,7 +32,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sse-reqwest-client = "0.1"
+sse-reqwest-client = "0.3"
 ```
 
 ### Quick Start

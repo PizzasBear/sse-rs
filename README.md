@@ -36,7 +36,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sse-reqwest-client = "0.1"
+sse-reqwest-client = "0.3"
 reqwest = { version = "0.12", features = ["stream"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3"
