@@ -1,9 +1,13 @@
 use alloc::{borrow::Cow, string::String, sync::Arc, vec, vec::Vec};
-use core::{fmt, num::NonZeroUsize, str};
+use core::{
+    fmt, iter,
+    num::{NonZeroU8, NonZeroUsize},
+    str,
+};
 use thiserror::Error;
 
 use bytes::Buf;
-use memchr::{memchr, memchr2, memchr3};
+use memchr::{memchr, memchr2};
 
 /// Represents a single Server-Sent Event message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,45 +99,6 @@ impl fmt::Debug for ShowBigBuf<'_> {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct FieldMode {
-    len: u8,
-    buf: [u8; 5],
-}
-
-impl FieldMode {
-    #[inline]
-    const fn new() -> Self {
-        Self {
-            len: 0,
-            buf: [0; 5],
-        }
-    }
-
-    #[inline]
-    fn try_extend(&mut self, src: &[u8]) -> bool {
-        let Some(dst) = (self.buf).get_mut(self.len as usize..self.len as usize + src.len()) else {
-            return false;
-        };
-        dst.copy_from_slice(src);
-        self.len += src.len() as u8;
-        true
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        &self.buf[..self.len as usize]
-    }
-}
-
-impl fmt::Debug for FieldMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("FieldMode")
-            .field(&ShowBigBuf(self.as_slice()))
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 enum ValueMode {
     Data,
@@ -142,10 +107,21 @@ enum ValueMode {
     Id,
 }
 
+impl ValueMode {
+    pub const fn field_name(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::Event => "event",
+            Self::Retry => "retry",
+            Self::Id => "id",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     Bom { bytes_read: u8 },
-    Field(FieldMode),
+    Field(Option<(ValueMode, NonZeroU8)>),
     Value(ValueMode),
     Ignore,
     PostCr,
@@ -297,7 +273,7 @@ impl SseDecoder {
     fn dispatch(&mut self, cr: bool) -> Option<SseEvent> {
         self.mode = match cr {
             true => Mode::PostCr,
-            false => Mode::Field(FieldMode::new()),
+            false => Mode::Field(None),
         };
 
         if self.corrupted {
@@ -400,7 +376,7 @@ impl SseDecoder {
 
                     if b0 != BOM[*bytes_read as usize] {
                         self.mode = match *bytes_read {
-                            0 => Mode::Field(FieldMode::new()),
+                            0 => Mode::Field(None),
                             _ => Mode::Ignore,
                         };
                         continue;
@@ -410,71 +386,64 @@ impl SseDecoder {
                     *bytes_read += 1;
 
                     if BOM.len() <= *bytes_read as usize {
-                        self.mode = Mode::Field(FieldMode::new());
+                        self.mode = Mode::Field(None);
                     }
                 }
-                Mode::Field(field) => {
-                    let Some(field_end) = memchr3(b':', b'\r', b'\n', chunk) else {
-                        if !field.try_extend(chunk) {
-                            self.mode = Mode::Ignore;
-                        }
-                        buf.advance(chunk.len());
-                        continue;
-                    };
+                Mode::Field(None) => {
+                    let b0 = chunk[0];
+                    buf.advance(1);
+                    let mode = match b0 {
+                        b'd' if !self.corrupted => ValueMode::Data,
+                        b'e' if !self.corrupted => ValueMode::Event,
+                        b'i' if !self.corrupted => ValueMode::Id,
+                        b'r' => ValueMode::Retry,
 
-                    let subchunk = &chunk[..field_end];
-                    let b0 = chunk[field_end];
-
-                    if !field.try_extend(subchunk) {
-                        self.mode = Mode::Ignore;
-                        buf.advance(subchunk.len());
-                        continue;
-                    }
-
-                    buf.advance(subchunk.len() + 1);
-
-                    let value = match field.as_slice() {
-                        b"data" if !self.corrupted => ValueMode::Data,
-                        b"event" if !self.corrupted => {
-                            self.event_buf.clear();
-                            ValueMode::Event
-                        }
-                        b"id" if !self.corrupted => {
-                            self.last_event_id_buf.clear();
-                            ValueMode::Id
-                        }
-                        b"retry" => {
-                            self.retry_buf = None;
-                            ValueMode::Retry
-                        }
-                        b"" => match b0 {
-                            b':' => {
-                                self.mode = Mode::Ignore;
-                                continue;
-                            }
-                            b'\r' | b'\n' => match self.dispatch(b0 == b'\r') {
-                                Some(ev) => return Some(Ok(ev)),
-                                None => continue,
-                            },
-                            _ => unreachable!(),
+                        b'\n' | b'\r' => match self.dispatch(b0 == b'\r') {
+                            Some(ev) => return Some(Ok(ev)),
+                            None => continue,
                         },
+
                         _ => {
                             self.mode = Mode::Ignore;
                             continue;
                         }
                     };
+                    self.mode = Mode::Field(Some((mode, NonZeroU8::new(1).unwrap())));
+                }
+                &mut Mode::Field(Some((mode, ref mut len))) => {
+                    let cmp = &mode.field_name().as_bytes()[len.get() as usize..];
+                    if iter::zip(chunk, cmp).any(|(ch0, ch1)| ch0 != ch1) {
+                        self.mode = Mode::Ignore;
+                        continue;
+                    }
+                    let Some(&b_post) = chunk.get(cmp.len()) else {
+                        *len = NonZeroU8::new(len.get() + chunk.len() as u8).unwrap();
+                        buf.advance(chunk.len());
+                        continue;
+                    };
+                    buf.advance(cmp.len() + 1);
 
-                    match b0 {
-                        b'\n' => self.mode = Mode::Field(FieldMode::new()),
+                    match b_post {
+                        b'\n' => self.mode = Mode::Field(None),
                         b'\r' => self.mode = Mode::PostCr,
                         b':' => {
-                            self.mode = Mode::PostColon(value);
+                            match mode {
+                                ValueMode::Data => {}
+                                ValueMode::Event => self.event_buf.clear(),
+                                ValueMode::Id => self.last_event_id_buf.clear(),
+                                ValueMode::Retry => self.retry_buf = None,
+                            }
+
+                            self.mode = Mode::PostColon(mode);
                             continue;
                         }
-                        _ => unreachable!(),
+                        _ => {
+                            self.mode = Mode::Ignore;
+                            continue;
+                        }
                     }
 
-                    match value {
+                    match mode {
                         ValueMode::Data => self.data_buf.push(b'\n'),
                         ValueMode::Id => self.last_event_id_buf.clear(),
                         ValueMode::Event | ValueMode::Retry => {}
@@ -507,7 +476,7 @@ impl SseDecoder {
                                 break;
                             }
                             b'\n' => {
-                                self.mode = Mode::Field(FieldMode::new());
+                                self.mode = Mode::Field(None);
                                 return_event = true;
                                 break;
                             }
@@ -581,7 +550,7 @@ impl SseDecoder {
                     if chunk[0] == b'\n' {
                         buf.advance(1);
                     }
-                    self.mode = Mode::Field(FieldMode::new());
+                    self.mode = Mode::Field(None);
                 }
                 Mode::PostColon(value) => {
                     if chunk[0] == b' ' {
@@ -646,7 +615,7 @@ fn consume_until_newline(
             continue;
         };
 
-        if let Some(out) = out {
+        if let Some(out) = out.as_deref_mut() {
             if max_size.get() < out.len() + i {
                 out.clear();
                 *mode = Mode::Ignore;
@@ -657,7 +626,7 @@ fn consume_until_newline(
 
         *mode = match chunk[i] {
             b'\r' => Mode::PostCr,
-            b'\n' => Mode::Field(FieldMode::new()),
+            b'\n' => Mode::Field(None),
             _ => unreachable!(),
         };
 
@@ -679,6 +648,7 @@ fn hard_parse() -> Result<(), PayloadTooLargeError> {
 event: my-event\r
 data:line1
 data: line2
+data
 :
 id: my-id
 :should be ignored too\rretry:42
@@ -709,7 +679,7 @@ data:ignored
             SseEvent::Retry(42),
             SseEvent::Message(MessageEvent {
                 event: "my-event".into(),
-                data: "line1\nline2".into(),
+                data: "line1\nline2\n".into(),
                 last_event_id: id.clone()
             }),
             SseEvent::Message(MessageEvent {
@@ -781,11 +751,12 @@ data: mid
 
 event: jojo
 id: ignored
-data: 01234567890
+data: 01234
+data: 56789
 retry: 10
 
 event: final
-data:
+data
 
 ";
 

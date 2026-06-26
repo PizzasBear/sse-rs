@@ -3,6 +3,7 @@ use std::{fmt::Write, hint::black_box, time::Duration};
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
 use eventsource_stream::Eventsource;
+use thiserror::Error;
 use tokio_stream::StreamExt;
 
 use sse_core::{SseDecoder, SseStream};
@@ -58,8 +59,12 @@ fn bench_sync_decoder(c: &mut Criterion) {
     group.finish();
 }
 
+#[derive(Debug, Clone, Error)]
+#[error("{0}")]
+struct StrError(String);
+
 fn bench_async_cmp(c: &mut Criterion, group_name: &str, payload: Bytes, num_chunks: usize) {
-    let chunks: Vec<Result<_, String>> = split_chunks(&payload, num_chunks).map(Ok).collect();
+    let chunks: Vec<Result<_, StrError>> = split_chunks(&payload, num_chunks).map(Ok).collect();
 
     let mut group = c.benchmark_group(group_name);
 
@@ -87,6 +92,17 @@ fn bench_async_cmp(c: &mut Criterion, group_name: &str, payload: Bytes, num_chun
                 black_box(event);
             }
         });
+    });
+
+    group.bench_function("sse_stream", |b| {
+        b.to_async(runtime.handle()).iter(|| async {
+            let mut sse_stream =
+                sse_stream::SseStream::from_byte_stream(tokio_stream::iter(chunks.iter().cloned()));
+
+            while let Some(Ok(event)) = sse_stream.next().await {
+                black_box(event);
+            }
+        })
     });
 
     group.finish();

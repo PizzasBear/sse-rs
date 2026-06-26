@@ -76,12 +76,12 @@ processing heavily fragmented network streams or large data payloads.
 The benchmarks were ran with realistic network fragmentation across standard
 1460-byte TCP packet boundaries unless said otherwise.
 
-| Benchmark Scenario                                 | `sse-core`      | `eventsource-stream` | Delta             |
-| :------------------------------------------------- | :-------------- | :------------------- | :---------------- |
-| **Large Events (40KiB)**                           | **~3.52 GiB/s** | ~83.7 MiB/s          | _~42x Faster_     |
-| **Small Events (9B)**                              | **~345 MiB/s**  | ~120 MiB/s           | _~2.8x Faster_    |
-| **Keepalives**                                     | **~531 MiB/s**  | ~158 MiB/s           | _~3.4x Faster_    |
-| **High Fragmentation (4KiB data, 10-byte chunks)** | **~503 MiB/s**  | ~5.4 MiB/s           | _**~93x Faster**_ |
+| Benchmark Scenario                                 | `sse-core`      | `eventsource-stream` | `sse-stream`    |
+| :------------------------------------------------- | :-------------- | :------------------- | :-------------- |
+| **Large Events (40KiB)**                           | **~3.50 GiB/s** | ~73.2 MiB/s          | ~1.45 GiB/s     |
+| **Small Events (9B)**                              | **~419 MiB/s**  | ~124 MiB/s           | ~348 MiB/s      |
+| **Keepalives**                                     | ~1.23 GiB/s     | ~155 MiB/s           | **~1.46 GiB/s** |
+| **High Fragmentation (4KiB data, 10-byte chunks)** | **~510 MiB/s**  | ~5.14 MiB/s          | ~66.1 MiB/s     |
 
 These benchmarks were run using `cargo bench` on a Ryzen 5900x Linux PC.
 

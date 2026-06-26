@@ -885,6 +885,7 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "serde",
+ "sse-stream",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -904,6 +905,19 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-test",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3962b63f038885f15bce2c6e02c0e7925c072f1ac86bb60fd44c5c6b762fb72"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]
