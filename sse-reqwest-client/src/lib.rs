@@ -489,6 +489,7 @@ impl EventSource {
             .calculate_backoff(self.reconnection_time_ms, self.connection_attempt);
         self.connection_attempt += 1;
         if let Some(dur) = wait_dur {
+            self.stream.close();
             self.state = State::Sleeping(Box::pin(sleep(dur)));
             Ok(SseEvent::Error(cause))
         } else {
@@ -579,10 +580,7 @@ impl Stream for EventSource {
 
                         return Poll::Ready(Some(Ok(SseEvent::Open)));
                     }
-                    Err(err) => {
-                        slf.close();
-                        return Poll::Ready(Some(slf.go_to_sleep(err.into())));
-                    }
+                    Err(err) => return Poll::Ready(Some(slf.go_to_sleep(err.into()))),
                 },
 
                 State::Open => match ready!(Pin::new(&mut slf.stream).poll_next(cx)) {
