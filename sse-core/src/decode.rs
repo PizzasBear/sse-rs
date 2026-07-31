@@ -1,6 +1,6 @@
 use alloc::{borrow::Cow, string::String, sync::Arc, vec, vec::Vec};
 use core::{
-    fmt, iter,
+    fmt, iter, mem,
     num::{NonZeroU8, NonZeroUsize},
     str,
 };
@@ -291,6 +291,12 @@ impl SseDecoder {
         self.staged_last_event_id = self.last_event_id.clone();
     }
 
+    /// An event boundary that yields nothing — the blank line after a comment, a
+    /// keepalive, a discarded event — is by far the most common one on an idle
+    /// stream, so that case is kept small enough to inline into [`next()`](Self::next)
+    /// and the message-building tail is pushed out of line into
+    /// [`dispatch_message()`](Self::dispatch_message).
+    #[inline]
     fn dispatch(&mut self, cr: bool) -> Option<SseEvent> {
         self.mode = match cr {
             true => Mode::PostCr,
@@ -305,23 +311,46 @@ impl SseDecoder {
 
         self.last_event_id = self.staged_last_event_id.clone();
 
-        match self.data_buf.last() {
-            Some(b'\n') => {
-                self.data_buf.pop();
-            }
-            Some(_) => {}
-            None => {
-                self.event_buf.clear();
-                return None;
-            }
+        // No data means no event, per the spec's "if the data buffer is empty" step.
+        if self.data_buf.is_empty() {
+            self.event_buf.clear();
+            return None;
         }
 
-        let data = String::from_utf8_lossy(&self.data_buf).into_owned();
+        self.dispatch_message()
+    }
+
+    /// The allocating half of [`dispatch()`](Self::dispatch), split out so that
+    /// inlining the no-event fast path above does not drag this into every one of
+    /// its call sites.
+    fn dispatch_message(&mut self) -> Option<SseEvent> {
+        // The trailing separator appended by the last `data` line is not part of
+        // the payload.
+        if let Some(b'\n') = self.data_buf.last() {
+            self.data_buf.pop();
+        }
+
+        // Hand the accumulated bytes over to the `String` rather than copying them
+        // into a fresh allocation: on a large event that copy costs more than the
+        // rest of the decoder put together. `data_buf` is replaced with an empty
+        // buffer of the same capacity so the next event still accumulates without
+        // reallocating, which leaves peak memory where it was — the copying version
+        // also held the payload twice for the duration of the copy.
+        let data = match String::from_utf8(mem::take(&mut self.data_buf)) {
+            Ok(data) => {
+                self.data_buf = Vec::with_capacity(data.capacity());
+                data
+            }
+            Err(err) => {
+                self.data_buf = err.into_bytes();
+                String::from_utf8_lossy(&self.data_buf).into_owned()
+            }
+        };
         self.data_buf.clear();
 
         let event = match &*self.event_buf {
             b"" => Cow::Borrowed("message"),
-            event_buf => Cow::Owned(String::from_utf8_lossy(event_buf).into_owned()),
+            event_buf => Cow::Owned(from_utf8_lossy(event_buf).into_owned()),
         };
         self.event_buf.clear();
 
@@ -438,6 +467,30 @@ impl SseDecoder {
 
                         _ => {
                             self.mode = Mode::Ignore;
+
+                            // Skip the rest of the line here rather than looping back
+                            // through the `self.mode` dispatch: comments are the most
+                            // common line shape in a keepalive-heavy stream, and the
+                            // extra trip through the state machine costs more than the
+                            // scan it guards.
+                            consume_until_newline(&mut self.mode, None, self.max_payload_size, buf)
+                                .expect("there should be no payload to grow too large");
+
+                            // A comment is usually the last line of its event — a
+                            // keepalive is nothing but a comment and the blank line
+                            // after it — so consume that blank line here too when it
+                            // is the empty dispatch, which is the only outcome a
+                            // keepalive can have. Anything that would actually yield
+                            // an event, or resume in another mode, is left to the
+                            // regular path below rather than duplicated here.
+                            let blank_line_follows = matches!(self.mode, Mode::Field(None))
+                                && buf.chunk().first() == Some(&b'\n');
+
+                            if blank_line_follows && !self.corrupted && self.data_buf.is_empty() {
+                                buf.advance(1);
+                                self.last_event_id = self.staged_last_event_id.clone();
+                                self.event_buf.clear();
+                            }
                             continue;
                         }
                     };
@@ -467,7 +520,18 @@ impl SseDecoder {
                                 ValueMode::Retry => self.retry_buf = None,
                             }
 
-                            self.mode = Mode::PostColon(mode);
+                            // Skip the optional space here rather than spending a
+                            // whole trip through the dispatch on a single byte. If
+                            // the chunk ends on the colon there is nothing to look
+                            // at yet, so fall back to resuming in `PostColon`.
+                            self.mode = match buf.chunk().first() {
+                                Some(&b' ') => {
+                                    buf.advance(1);
+                                    Mode::Value(mode)
+                                }
+                                Some(_) => Mode::Value(mode),
+                                None => Mode::PostColon(mode),
+                            };
                             continue;
                         }
                         _ => {
@@ -579,7 +643,7 @@ impl SseDecoder {
                             if memchr(0, &self.last_event_id_buf).is_none() {
                                 self.staged_last_event_id = match &*self.last_event_id_buf {
                                     [] => None,
-                                    buf => Some(String::from_utf8_lossy(buf).into()),
+                                    buf => Some(from_utf8_lossy(buf).into()),
                                 };
                             }
                             self.last_event_id_buf.clear();
@@ -636,6 +700,22 @@ impl fmt::Debug for SseDecoder {
             .field("retry_buf", &self.retry_buf)
             .field("max_payload_size", &self.max_payload_size)
             .finish()
+    }
+}
+
+/// Drop-in replacement for [`String::from_utf8_lossy`] that validates with
+/// [`str::from_utf8`] first.
+///
+/// The lossy conversion walks its input with the scalar `Utf8Chunks` iterator
+/// even when the input needs no repair at all, which measures ~7x slower than
+/// `str::from_utf8`'s word-at-a-time ASCII scan. Every event carrying a payload
+/// goes through here, so the valid case is worth splitting out; malformed input
+/// still takes the same lossy path it always did.
+#[inline]
+fn from_utf8_lossy(buf: &[u8]) -> Cow<'_, str> {
+    match str::from_utf8(buf) {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => String::from_utf8_lossy(buf),
     }
 }
 
@@ -738,6 +818,16 @@ data:ignored
             })
         ]
     );
+
+    // Feeding the whole buffer at once has to agree byte for byte with feeding it
+    // one byte at a time. The two exercise different code: several arms take a
+    // short cut when the bytes they need are already in the chunk, and those short
+    // cuts are unreachable when every chunk is a single byte.
+    let mut decoder = SseDecoder::new();
+    let mut buf = bytes.as_bytes();
+    let whole = iter::from_fn(|| decoder.next(&mut buf)).collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(whole, events);
+
     Ok(())
 }
 
@@ -829,6 +919,35 @@ fn test_valueless_data_respects_the_limit() {
             last_event_id: None,
         }))),
     );
+}
+
+/// Invalid UTF-8 is lossy-converted rather than rejected, in every field that
+/// accumulates text. Regression test for [`from_utf8_lossy`]: it validates with
+/// `str::from_utf8` first and only falls back to the lossy walk, so the repaired
+/// output has to stay byte-for-byte what `String::from_utf8_lossy` produced.
+#[test]
+fn test_invalid_utf8_is_lossy() {
+    let mut buf: &[u8] =
+        b"event: ev\xffent\nid: my\xff-id\ndata: he\xed\xa0\x80llo\ndata: \xf0\x9f\x92\xa9 ok\n\n";
+
+    let mut decoder = SseDecoder::new();
+    let Some(Ok(SseEvent::Message(msg))) = decoder.next(&mut buf) else {
+        panic!("expected a message");
+    };
+
+    assert_eq!(msg.event, String::from_utf8_lossy(b"ev\xffent"));
+    assert_eq!(
+        msg.data,
+        String::from_utf8_lossy(b"he\xed\xa0\x80llo\n\xf0\x9f\x92\xa9 ok")
+    );
+    assert_eq!(
+        msg.last_event_id.as_deref(),
+        Some(&*String::from_utf8_lossy(b"my\xff-id")),
+    );
+
+    // A valid multi-byte sequence must survive untouched.
+    assert!(msg.data.contains('\u{1F4A9}'));
+    assert!(buf.is_empty());
 }
 
 #[test]

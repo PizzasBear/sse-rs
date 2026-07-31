@@ -78,10 +78,17 @@ The benchmarks were ran with realistic network fragmentation across standard
 
 | Benchmark Scenario                                 | `sse-core`      | `eventsource-stream` | `sse-stream`    |
 | :------------------------------------------------- | :-------------- | :------------------- | :-------------- |
-| **Large Events (40KiB)**                           | **~3.50 GiB/s** | ~73.2 MiB/s          | ~1.45 GiB/s     |
-| **Small Events (9B)**                              | **~419 MiB/s**  | ~124 MiB/s           | ~348 MiB/s      |
-| **Keepalives**                                     | ~1.23 GiB/s     | ~155 MiB/s           | **~1.46 GiB/s** |
-| **High Fragmentation (4KiB data, 10-byte chunks)** | **~510 MiB/s**  | ~5.14 MiB/s          | ~66.1 MiB/s     |
+| **Large Events (40KiB)**                           | **~16.9 GiB/s** | ~70.3 MiB/s          | ~1.43 GiB/s     |
+| **Small Events (9B)**                              | **~483 MiB/s**  | ~118 MiB/s           | ~316 MiB/s      |
+| **Keepalives**                                     | **~1.55 GiB/s** | ~151 MiB/s           | ~1.53 GiB/s     |
+| **High Fragmentation (4KiB data, 10-byte chunks)** | **~574 MiB/s**  | ~5.00 MiB/s          | ~69.6 MiB/s     |
+
+Keepalives are the one scenario where `sse-core` holds no real lead: a stream of
+comment lines is the worst case for a resumable state machine, since it maximises
+the number of lines per byte, and the gap to `sse-stream` there is smaller than
+the run-to-run spread. That is the same trade that wins the fragmentation row by
+an order of magnitude — `sse-stream` splits a whole chunk into lines at once,
+which is fast until a line is split across chunks.
 
 These benchmarks were run using `cargo bench` on a Ryzen 5900x Linux PC.
 
@@ -92,6 +99,11 @@ and instruction cache thrashing, these results represent the stabilized metrics.
 To eliminate layout-induced variance and ensure reproducible results, the
 benchmarks were compiled using Fat LTO alongside explicit LLVM alignment flags:
 `RUSTFLAGS="-C llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=6"`
+
+The figures above are medians of seven full runs of the suite, each pinned to a
+single core. Machine noise only ever makes a run slower, so the spread across
+runs — 3–7% for most entries, and up to 24% for `sse-stream` on large events —
+is a better guide to how much a difference means than any single run is.
 
 ## Feature Flags
 
