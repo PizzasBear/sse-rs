@@ -1,6 +1,6 @@
 [package]
 name = "sse-core"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.79.0"
 description = "A high-performance, zero-I/O, no_std compatible state-machine parser for Server-Sent Events (SSE)."

@@ -73,7 +73,22 @@ impl SseRetryConfig {
 
     /// Calculates the delay duration for the next reconnection attempt.
     ///
+    /// `jitter_factor` selects a point between the base delay and the computed
+    /// backoff; values outside `0.0..=1.0` (and non-finite ones) are treated as
+    /// `1.0`. It is ignored unless [`Self::jitter`] is set *and* the backoff has
+    /// actually grown past the base delay, since otherwise there is nothing to
+    /// pick between.
+    ///
     /// Returns [`None`] if the `attempt` count exceeds [`Self::max_retries`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Self::min_sleep_ms`] is greater than [`Self::max_backoff_ms`],
+    /// which would make the delay range empty. Both fields are public, so this is
+    /// reachable by mutating a config after construction; the constructors
+    /// ([`new()`](Self::new), [`disabled()`](Self::disabled)) never produce such a
+    /// config. An exhausted `attempt` returns [`None`] before the check, so such a
+    /// config only panics while it still has retries left.
     #[must_use]
     pub fn calculate_backoff_with_factor(
         &self,
@@ -110,9 +125,15 @@ impl SseRetryConfig {
         Some(Duration::from_millis(sleep_ms as _))
     }
 
-    /// Calculates the delay duration for the next reconnection attempt.
+    /// Calculates the delay duration for the next reconnection attempt, drawing
+    /// the jitter factor from [`fastrand`].
     ///
     /// Returns [`None`] if the `attempt` count exceeds [`Self::max_retries`].
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as
+    /// [`calculate_backoff_with_factor()`](Self::calculate_backoff_with_factor).
     #[must_use]
     #[cfg(feature = "fastrand")]
     pub fn calculate_backoff(&self, reconnect_time_ms: u32, attempt: u32) -> Option<Duration> {

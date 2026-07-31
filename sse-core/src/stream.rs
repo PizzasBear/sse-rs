@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use core::{
+    fmt,
     pin::Pin,
     str,
     task::{self, ready, Poll},
@@ -17,7 +18,7 @@ use crate::{PayloadTooLargeError, SseDecoder, SseEvent};
 
 pin_project! {
     /// An asynchronous stream wrapper that parses SSE events from an underlying byte stream.
-    #[derive(Debug, Clone, Default)]
+    #[derive(Clone)]
     pub struct SseStream<T: TryStream> {
         #[pin]
         inner: Option<T>,
@@ -195,6 +196,23 @@ impl<T: TryStream> SseStream<T> {
     fn clear_bufs(&mut self) {
         self.inner = None;
         self.buf = None;
+    }
+}
+
+/// Equivalent to [`SseStream::disconnected()`].
+impl<T: TryStream> Default for SseStream<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::disconnected()
+    }
+}
+
+impl<T: TryStream> fmt::Debug for SseStream<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SseStream")
+            .field("is_closed", &self.is_closed())
+            .field("decoder", &self.decoder)
+            .finish_non_exhaustive()
     }
 }
 

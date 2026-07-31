@@ -25,6 +25,11 @@ behaviors out of the box, including automatic network reconnections, handling
   retrying recoverable proxy or server errors (e.g., 502, 503, 504, 429).
 - **Smart Backoff:** Implements exponential backoff with jitter, automatically
   adapting to the delays requested by the server via `retry` events.
+- **Bounded Memory:** A configurable per-event payload limit caps how much a
+  hostile or malfunctioning server can make the client buffer. Oversized events
+  are dropped and reported as `SseEvent::Discarded` without interrupting the
+  connection, so one bad event can't end a long-lived subscription — or, with
+  `fail_on_oversized_event(true)`, treated as a fatal error instead.
 
 ## Usage
 
@@ -32,7 +37,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sse-reqwest-client = "0.3"
+sse-reqwest-client = "0.4"
 ```
 
 ### Quick Start
@@ -62,6 +67,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SseEvent::Error(err) => {
                 eprintln!("Connection dropped, attempting to reconnect: {}", err);
             }
+            SseEvent::Discarded(err) => {
+                // One event exceeded `max_payload_size` and was dropped. The
+                // connection is still open; the stream carries on from the next event.
+                eprintln!("Skipped an oversized event: {}", err);
+            }
         }
     }
 
@@ -89,6 +99,37 @@ let mut stream = client
     .max_payload_size(NonZeroUsize::new(1024 * 1024).unwrap()) // 1MB limit
     .build();
 ```
+
+### Oversized Events
+
+By default an event larger than `max_payload_size` is dropped and surfaced as
+`SseEvent::Discarded`, leaving the connection open — exactly one event is lost
+and the stream carries on from the next one. If losing an event is not something
+your application can continue past, opt into treating it as fatal:
+
+```rust,no_run
+# use std::num::NonZeroUsize;
+use sse_reqwest_client::RequestBuilderExt;
+
+let client = reqwest::Client::new();
+
+let mut stream = client
+    .get("https://example.com/api/events")
+    .into_event_source_builder()
+    .max_payload_size(NonZeroUsize::new(1024 * 1024).unwrap())
+    .fail_on_oversized_event(true)
+    .build();
+```
+
+The stream then closes and yields `Err(Error::PayloadTooLarge)` instead, and
+`SseEvent::Discarded` is never emitted. Prefer this over escalating `Discarded`
+by hand in a stream combinator: doing it by hand produces an `Err` while the
+`EventSource` is still open, whereas the flag closes it first.
+
+Note that reconnecting after this replays the oversized event — the decoder
+rolls its `id:` back to the last *delivered* event, so a replaying server rewinds
+to before it. Recover by rebuilding with a larger limit and the saved
+`last_event_id()`, not by calling `force_reconnect()`.
 
 ## Important Note on Timeouts
 

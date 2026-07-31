@@ -170,7 +170,12 @@ impl SseDecoder {
     /// Creates a new decoder with a custom maximum payload size limit.
     ///
     /// This is useful in memory-constrained environments or when connecting to
-    /// untrusted servers to prevent memory exhaustion from infinitely long lines.
+    /// untrusted servers to prevent memory exhaustion from unbounded input.
+    ///
+    /// The limit applies independently to each of the three values an event
+    /// accumulates — its data, its name and its ID — so peak memory is a small
+    /// multiple of `max_payload_size` rather than exactly that. See
+    /// [`next()`](Self::next) for what each of them accumulates.
     ///
     /// # Example
     /// ```rust
@@ -262,6 +267,22 @@ impl SseDecoder {
         self.corrupted = true
     }
 
+    /// Appends the newline separating two `data` lines, subject to the same limit
+    /// as the line contents. `consume_until_newline` never sees these bytes, so
+    /// without this a stream of empty `data` lines would grow `data_buf` unbounded.
+    ///
+    /// A *trailing* separator is allowed to sit one byte past the limit, since it is
+    /// popped at dispatch rather than delivered; anything appended after it is
+    /// checked against the full length and so still errors.
+    fn push_data_newline(&mut self) -> Result<(), PayloadTooLargeError> {
+        if self.max_payload_size.get() < self.data_buf.len() {
+            self.mark_corrupted();
+            return Err(PayloadTooLargeError);
+        }
+        self.data_buf.push(b'\n');
+        Ok(())
+    }
+
     #[inline]
     fn clear_bufs(&mut self) {
         self.data_buf.clear();
@@ -340,8 +361,20 @@ impl SseDecoder {
     ///
     /// # Errors
     ///
-    /// Returns a [`PayloadTooLargeError`] if a single field (like data or event name)
-    /// exceeds the maximum payload size limit configured for this decoder.
+    /// Returns a [`PayloadTooLargeError`] when an event's accumulated data, name
+    /// or ID would exceed the maximum payload size configured for this decoder.
+    /// The limit is *not* per line:
+    ///
+    /// * `data` accumulates every `data:` line of the current event, joined by
+    ///   newlines, so the limit bounds the whole event payload and is only reset
+    ///   once the event is dispatched.
+    /// * `event` and `id` are reset by each `event:` / `id:` field, so for those
+    ///   the limit does bound a single line.
+    ///
+    /// The offending event is discarded rather than silently truncated: the
+    /// decoder skips the rest of the current event and resynchronizes at the next
+    /// event boundary, so it stays usable after the error. `retry:` fields are
+    /// still honoured while the discarded event is being skipped.
     pub fn next(&mut self, buf: &mut impl Buf) -> Option<Result<SseEvent, PayloadTooLargeError>> {
         // # 9.2.5 Parsing an event stream
         //
@@ -443,10 +476,22 @@ impl SseDecoder {
                         }
                     }
 
+                    // A field name with no colon carries the empty string as its
+                    // value, so the target buffer must be reset, not left alone.
+                    // `retry` is the exception: it accumulates nothing, and the
+                    // `retry:` form already clears `retry_buf` before parsing into it.
                     match mode {
-                        ValueMode::Data => self.data_buf.push(b'\n'),
-                        ValueMode::Id => self.last_event_id_buf.clear(),
-                        ValueMode::Event | ValueMode::Retry => {}
+                        ValueMode::Data => {
+                            if let Err(err) = self.push_data_newline() {
+                                return Some(Err(err));
+                            }
+                        }
+                        ValueMode::Event => self.event_buf.clear(),
+                        ValueMode::Id => {
+                            self.last_event_id_buf.clear();
+                            self.staged_last_event_id = None;
+                        }
+                        ValueMode::Retry => {}
                     }
                 }
                 Mode::Value(ValueMode::Retry) => {
@@ -500,7 +545,11 @@ impl SseDecoder {
                         self.max_payload_size,
                         buf,
                     ) {
-                        Ok(true) => self.data_buf.push(b'\n'),
+                        Ok(true) => {
+                            if let Err(err) = self.push_data_newline() {
+                                return Some(Err(err));
+                            }
+                        }
                         Ok(false) => {}
                         Err(err) => {
                             self.mark_corrupted();
@@ -690,6 +739,96 @@ data:ignored
         ]
     );
     Ok(())
+}
+
+/// Per the spec, a line with no colon is a field whose value is the empty string,
+/// so a bare `event` / `id` must *reset* its buffer rather than leave the previous
+/// value in place. Regression test: `id` leaking across events also leaks into the
+/// `Last-Event-ID` sent on reconnect.
+#[test]
+fn test_valueless_fields() {
+    fn messages(bytes: &str) -> Vec<(String, String, Option<String>)> {
+        let mut decoder = SseDecoder::new();
+        let mut buf = bytes.as_bytes();
+        let mut out = vec![];
+        while let Some(SseEvent::Message(msg)) = decoder.next(&mut buf).transpose().unwrap() {
+            out.push((
+                msg.event.into_owned(),
+                msg.data,
+                msg.last_event_id.map(|id| id.to_string()),
+            ));
+        }
+        out
+    }
+
+    // A bare `event` resets the event type back to the "message" default.
+    assert_eq!(
+        messages("event: custom\nevent\ndata: x\n\n"),
+        [("message".into(), "x".into(), None)],
+    );
+
+    // A bare `id` clears the ID, exactly like the `id:` form does.
+    for bytes in [
+        "id: abc\ndata: 1\n\nid\ndata: 2\n\n",
+        "id: abc\ndata: 1\n\nid:\ndata: 2\n\n",
+    ] {
+        assert_eq!(
+            messages(bytes),
+            [
+                ("message".into(), "1".into(), Some("abc".into())),
+                ("message".into(), "2".into(), None),
+            ],
+            "for {bytes:?}",
+        );
+    }
+
+    // A bare `data` still appends an empty line rather than resetting.
+    assert_eq!(
+        messages("data: a\ndata\ndata: b\n\n"),
+        [("message".into(), "a\n\nb".into(), None)],
+    );
+}
+
+/// Valueless `data` lines never reach `consume_until_newline`, so the separator each
+/// one appends has to be counted on its own. Regression test: without that check a
+/// server could grow `data_buf` a byte at a time, with no bound and no error, and
+/// have the oversized event delivered anyway.
+#[test]
+fn test_valueless_data_respects_the_limit() {
+    let limit = NonZeroUsize::new(10).unwrap();
+
+    // A payload made only of separators is still bounded by the limit.
+    let input = "data\n".repeat(100) + "\n";
+    let mut buf = input.as_bytes();
+    let mut decoder = SseDecoder::with_limit(limit);
+    assert_eq!(decoder.next(&mut buf), Some(Err(PayloadTooLargeError)));
+
+    // The rest of the event is skipped as a unit, leaving the decoder usable.
+    assert_eq!(decoder.next(&mut buf), None);
+    assert!(buf.is_empty());
+
+    let mut buf: &[u8] = b"data: after\n\n";
+    assert_eq!(
+        decoder.next(&mut buf),
+        Some(Ok(SseEvent::Message(MessageEvent {
+            event: "message".into(),
+            data: "after".into(),
+            last_event_id: None,
+        }))),
+    );
+
+    // A payload that exactly fills the limit is still legal, whatever it is made of.
+    let input = "data\n".repeat(limit.get() + 1) + "\n";
+    let mut buf = input.as_bytes();
+    let mut decoder = SseDecoder::with_limit(limit);
+    assert_eq!(
+        decoder.next(&mut buf),
+        Some(Ok(SseEvent::Message(MessageEvent {
+            event: "message".into(),
+            data: "\n".repeat(limit.get()),
+            last_event_id: None,
+        }))),
+    );
 }
 
 #[test]

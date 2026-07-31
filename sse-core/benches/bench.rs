@@ -96,8 +96,9 @@ fn bench_async_cmp(c: &mut Criterion, group_name: &str, payload: Bytes, num_chun
 
     group.bench_function("sse_stream", |b| {
         b.to_async(runtime.handle()).iter(|| async {
-            let mut sse_stream =
-                sse_stream::SseStream::from_byte_stream(tokio_stream::iter(chunks.iter().cloned()));
+            let mut sse_stream = sse_stream::SseStream::from_bytes_stream(tokio_stream::iter(
+                chunks.iter().cloned(),
+            ));
 
             while let Some(Ok(event)) = sse_stream.next().await {
                 black_box(event);

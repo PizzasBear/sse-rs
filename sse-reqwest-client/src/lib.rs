@@ -13,8 +13,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_core::stream::Stream;
-use reqwest::{RequestBuilder, StatusCode, header::HeaderValue};
+use futures_core::stream::{FusedStream, Stream};
+use reqwest::{RequestBuilder, Response, StatusCode, header::HeaderValue};
 use thiserror::Error;
 use tokio::time::{Instant, Sleep, sleep};
 
@@ -35,21 +35,54 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Error)]
 pub enum Error {
     /// The server responded with a non-200 HTTP status code.
-    #[error("unexpected HTTP status code: {0}")]
-    Status(StatusCode),
+    ///
+    /// The [`Response`] is attached rather than just its status, so the body —
+    /// which often carries the server's own description of the failure — can
+    /// still be read.
+    #[error("unexpected HTTP status code: {}", .0.status())]
+    Status(Box<Response>),
     /// The [`RequestBuilder`] could not be cloned (e.g., it contains a streaming body).
     #[error("request builder could not be cloned (e.g., non-restartable body stream)")]
     UncloneableRequest,
     /// The server's response lacked the `text/event-stream` Content-Type.
+    ///
+    /// The [`Response`] is attached so the offending Content-Type, and the body
+    /// the server actually sent, can still be inspected.
     #[error("invalid response HTTP Content-Type")]
-    InvalidContentType,
+    InvalidContentType(Box<Response>),
     /// The server's response did not contain a Content-Type header.
+    ///
+    /// The [`Response`] is attached so the rest of the response can still be
+    /// inspected.
     #[error("response HTTP Content-Type missing")]
-    MissingContentType,
+    MissingContentType(Box<Response>),
     /// The client exhausted all retry attempts without successfully reconnecting.
     #[error("couldn't reconnect to SSE server in {0} attempts: {1}")]
     Timeout(u32, SseErrorEvent),
     /// The server sent an event payload that exceeded the configured buffer limit.
+    ///
+    /// By default the [`EventSource`] never produces this: an oversized event is
+    /// reported as the recoverable [`SseEvent::Discarded`] instead, because the
+    /// connection survives it. This variant is produced only when the stream was
+    /// built with [`fail_on_oversized_event(true)`], for applications that consider
+    /// a dropped event fatal:
+    ///
+    /// ```rust,no_run
+    /// # use sse_reqwest_client::RequestBuilderExt;
+    /// # let client = reqwest::Client::new();
+    /// let stream = client.get("https://example.com/events")
+    ///     .into_event_source_builder()
+    ///     .fail_on_oversized_event(true)
+    ///     .build();
+    /// ```
+    ///
+    /// Prefer that over escalating [`SseEvent::Discarded`] by hand in a stream
+    /// combinator. Doing it by hand yields an [`Err`] while the [`EventSource`]
+    /// itself stays [`Open`](ReadyState::Open), which contradicts this crate's rule
+    /// that every [`Err`] item is terminal and leaves the HTTP response attached;
+    /// the builder flag closes the stream first.
+    ///
+    /// [`fail_on_oversized_event(true)`]: EventSourceBuilder::fail_on_oversized_event
     #[error("server sent an oversized payload exceeding the allotted buffer")]
     PayloadTooLarge(#[from] PayloadTooLargeError),
     /// The `Last-Event-ID` provided by the server contains bytes that cannot be
@@ -117,7 +150,42 @@ pub enum SseEvent {
     ///
     /// This gives the application a chance to log the interruption or update UI state
     /// while the exponential backoff handles the recovery in the background.
+    ///
+    /// This mirrors the [`error` event] of the JavaScript `EventSource` API, and like it
+    /// this is strictly about the *connection*. A message that arrives intact but cannot
+    /// be kept is reported as [`Discarded`](Self::Discarded) instead.
+    ///
+    /// [`error` event]: https://developer.mozilla.org/en-US/docs/Web/API/EventSource/error_event
     Error(SseErrorEvent),
+    /// Emitted when an event exceeded [`max_payload_size`] and was thrown away.
+    ///
+    /// The connection is **still open** and still healthy: the decoder enforced the
+    /// limit you configured, dropped the offending event rather than buffering past
+    /// that limit, and resynchronized at the next event boundary. Exactly one event
+    /// was lost, and the events on either side of it are unaffected. Ignoring this
+    /// variant is a valid choice; the stream simply continues.
+    ///
+    /// This has no counterpart in the JavaScript `EventSource` API, which has no payload
+    /// limit to enforce, so it is deliberately kept separate from
+    /// [`Error`](Self::Error) rather than widening what that variant means.
+    ///
+    /// # Choosing a reaction
+    ///
+    /// If a dropped event is unacceptable for your application, build the stream with
+    /// [`fail_on_oversized_event(true)`] and this variant is never emitted: the stream
+    /// closes and yields [`Error::PayloadTooLarge`] instead. You can also stop the
+    /// stream at any point yourself with [`EventSource::close()`].
+    ///
+    /// **Do not reconnect in response to this.** An oversized event never advances the
+    /// `Last-Event-ID`, because the decoder rolls back the discarded event's `id:` to
+    /// the last one it actually delivered. A server that honours `Last-Event-ID` will
+    /// therefore replay from *before* the oversized event and send it again, which is
+    /// rejected again — [`force_reconnect()`](EventSource::force_reconnect) here can
+    /// spin indefinitely. Raise [`max_payload_size`] instead if you need the event.
+    ///
+    /// [`max_payload_size`]: EventSourceBuilder::max_payload_size
+    /// [`fail_on_oversized_event(true)`]: EventSourceBuilder::fail_on_oversized_event
+    Discarded(PayloadTooLargeError),
 }
 
 impl SseEvent {
@@ -140,7 +208,7 @@ impl SseEvent {
     pub fn into_message(self) -> Option<MessageEvent> {
         match self {
             Self::Message(msg) => Some(msg),
-            Self::Open | Self::Error(_) => None,
+            Self::Open | Self::Error(_) | Self::Discarded(_) => None,
         }
     }
 
@@ -148,7 +216,7 @@ impl SseEvent {
     pub fn as_message(&self) -> Option<&MessageEvent> {
         match self {
             Self::Message(msg) => Some(msg),
-            Self::Open | Self::Error(_) => None,
+            Self::Open | Self::Error(_) | Self::Discarded(_) => None,
         }
     }
 
@@ -156,7 +224,7 @@ impl SseEvent {
     pub fn as_message_mut(&mut self) -> Option<&mut MessageEvent> {
         match self {
             Self::Message(msg) => Some(msg),
-            Self::Open | Self::Error(_) => None,
+            Self::Open | Self::Error(_) | Self::Discarded(_) => None,
         }
     }
 }
@@ -173,12 +241,19 @@ impl From<SseErrorEvent> for SseEvent {
     }
 }
 
+impl From<PayloadTooLargeError> for SseEvent {
+    fn from(err: PayloadTooLargeError) -> Self {
+        Self::Discarded(err)
+    }
+}
+
 /// Error indicating that an [`SseEvent`] could not be converted into a [`MessageEvent`].
 #[derive(Debug, Error)]
 #[error("couldn't convert Event::{} into a MessageEvent", match .0 {
     SseEvent::Open => "Open",
     SseEvent::Message(_) => "Message",
-    SseEvent::Error(_) => "Error"
+    SseEvent::Error(_) => "Error",
+    SseEvent::Discarded(_) => "Discarded"
 })]
 pub struct FromMessageEventError(pub SseEvent);
 
@@ -221,6 +296,7 @@ pub struct EventSourceBuilder {
     max_payload_size: Option<NonZeroUsize>,
     last_event_id: Option<Arc<str>>,
     retry_transient_errors: bool,
+    fail_on_oversized_event: bool,
     successful_connection_threshold: Duration,
 }
 
@@ -235,6 +311,7 @@ impl EventSourceBuilder {
             max_payload_size: None, // use default
             last_event_id: None,
             retry_transient_errors: false,
+            fail_on_oversized_event: false,
             successful_connection_threshold: Duration::from_secs(5),
         }
     }
@@ -265,6 +342,65 @@ impl EventSourceBuilder {
     #[must_use]
     pub fn max_payload_size(mut self, max_payload_size: NonZeroUsize) -> Self {
         self.max_payload_size = Some(max_payload_size);
+        self
+    }
+
+    /// Treats an event that exceeds [`max_payload_size`] as a fatal error.
+    ///
+    /// By default the limit is enforced without ending the subscription: the
+    /// oversized event is dropped, the decoder resynchronizes at the next event
+    /// boundary, and the loss is reported as [`SseEvent::Discarded`] while the
+    /// connection stays open. Exactly one event is lost and the memory bound —
+    /// the reason the limit exists — has already held by that point.
+    ///
+    /// Setting this to `true` instead closes the stream and yields
+    /// [`Err(Error::PayloadTooLarge)`](Error::PayloadTooLarge), for applications
+    /// where silently continuing past a lost event would be worse than stopping.
+    /// [`SseEvent::Discarded`] is then never emitted. As with every other [`Err`]
+    /// from this stream the closure is terminal: [`ready_state`] becomes
+    /// [`Closed`](ReadyState::Closed) and subsequent polls yield [`None`].
+    ///
+    /// Note that the trigger is server-controlled while the threshold is yours, so
+    /// enabling this lets a single large event from an otherwise healthy server end
+    /// a long-lived subscription. That asymmetry is why it is opt-in.
+    ///
+    /// # Recovering
+    ///
+    /// Do **not** simply call [`force_reconnect()`]. An oversized event never
+    /// advances the `Last-Event-ID` — the decoder rolls it back to the last event
+    /// it actually delivered — so a server that honours `Last-Event-ID` replays
+    /// from *before* the oversized event and sends it again, failing again.
+    ///
+    /// Instead, keep the resume point and rebuild with a limit that fits:
+    ///
+    /// ```rust,no_run
+    /// # use std::num::NonZeroUsize;
+    /// # use sse_reqwest_client::{EventSource, RequestBuilderExt};
+    /// # let client = reqwest::Client::new();
+    /// # let req = client.get("https://example.com/events");
+    /// # let stream = req.into_event_source();
+    /// // ... after the stream ended with `Error::PayloadTooLarge`:
+    /// let resume_from = stream.last_event_id().cloned();
+    ///
+    /// let mut builder = client.get("https://example.com/events")
+    ///     .into_event_source_builder()
+    ///     .fail_on_oversized_event(true)
+    ///     .max_payload_size(NonZeroUsize::new(4 * 1024 * 1024).unwrap());
+    ///
+    /// if let Some(id) = resume_from {
+    ///     builder = builder.last_event_id(id);
+    /// }
+    ///
+    /// let stream = builder.build();
+    /// ```
+    ///
+    /// [`max_payload_size`]: Self::max_payload_size
+    /// [`ready_state`]: EventSource::ready_state
+    /// [`force_reconnect()`]: EventSource::force_reconnect
+    #[inline]
+    #[must_use]
+    pub fn fail_on_oversized_event(mut self, fail: bool) -> Self {
+        self.fail_on_oversized_event = fail;
         self
     }
 
@@ -325,6 +461,7 @@ impl EventSourceBuilder {
             connected_since: None,
             retry_config: self.retry_config,
             retry_transient_errors: self.retry_transient_errors,
+            fail_on_oversized_event: self.fail_on_oversized_event,
             successful_connection_threshold: self.successful_connection_threshold,
             stream: SseStream::with_decoder(decoder),
             state: State::Disconnected,
@@ -337,9 +474,14 @@ pub struct EventSource {
     req: RequestBuilder,
     reconnection_time_ms: u32,
     connection_attempt: u32,
+    /// When the *currently live* connection opened, used to decide whether it
+    /// lasted long enough to reset the backoff counter. Must be cleared by every
+    /// path that abandons the connection, or a stale timestamp from an older
+    /// connection can wrongly reset the backoff of a later one.
     connected_since: Option<Instant>,
     retry_config: SseRetryConfig,
     retry_transient_errors: bool,
+    fail_on_oversized_event: bool,
     successful_connection_threshold: Duration,
     stream: SseStream<ByteStream>,
     state: State,
@@ -353,12 +495,10 @@ impl fmt::Debug for EventSource {
             .field("connection_attempt", &self.connection_attempt)
             .field("retry_config", &self.retry_config)
             .field("retry_transient_errors", &self.retry_transient_errors)
+            .field("fail_on_oversized_event", &self.fail_on_oversized_event)
+            .field("connected_since", &self.connected_since)
             .field("state", &self.state)
-            .field(
-                "stream.last_event_id()",
-                &self.stream.last_event_id().map(|id| &**id),
-            )
-            .field("stream.is_closed()", &self.stream.is_closed())
+            .field("stream", &self.stream)
             .finish_non_exhaustive()
     }
 }
@@ -406,6 +546,7 @@ impl EventSource {
     /// ```
     pub fn close(&mut self) {
         self.stream.close();
+        self.connected_since = None;
         self.state = State::Closed;
     }
 
@@ -460,6 +601,7 @@ impl EventSource {
     #[inline]
     pub fn force_reconnect(&mut self) {
         self.stream.close();
+        self.connected_since = None;
         self.connection_attempt = 0;
         self.state = State::Disconnected;
     }
@@ -474,6 +616,7 @@ impl EventSource {
     #[inline]
     pub fn force_reconnect_with_id(&mut self, id: Option<Arc<str>>) {
         self.stream.close_with_id(id);
+        self.connected_since = None;
         self.connection_attempt = 0;
         self.state = State::Disconnected;
     }
@@ -551,7 +694,8 @@ impl Stream for EventSource {
                             return Poll::Ready(Some(slf.go_to_sleep(SseErrorEvent::Http(status))));
                         } else if status != StatusCode::OK {
                             slf.close();
-                            return Poll::Ready(Some(Err(Error::Status(status))));
+                            let err = Error::Status(Box::new(res));
+                            return Poll::Ready(Some(Err(err)));
                         }
 
                         let Some(content_type) = res
@@ -560,18 +704,14 @@ impl Stream for EventSource {
                             .map(|v| v.as_bytes())
                         else {
                             slf.close();
-                            return Poll::Ready(Some(Err(Error::MissingContentType)));
+                            let err = Error::MissingContentType(Box::new(res));
+                            return Poll::Ready(Some(Err(err)));
                         };
 
-                        const MIME_EVENT_STREAM: &str = "text/event-stream";
-                        if !(content_type.starts_with(MIME_EVENT_STREAM.as_bytes())
-                            && matches!(
-                                content_type.get(MIME_EVENT_STREAM.len()),
-                                None | Some(b';' | b' ' | b'\t')
-                            ))
-                        {
+                        if !is_event_stream(content_type) {
                             slf.close();
-                            return Poll::Ready(Some(Err(Error::InvalidContentType)));
+                            let err = Error::InvalidContentType(Box::new(res));
+                            return Poll::Ready(Some(Err(err)));
                         }
 
                         slf.state = State::Open;
@@ -588,9 +728,21 @@ impl Stream for EventSource {
                         SseEventCore::Retry(ms) => slf.reconnection_time_ms = ms,
                         SseEventCore::Message(event) => return Poll::Ready(Some(Ok(event.into()))),
                     },
+                    // The limit has already done its job: the decoder refused to grow
+                    // its buffer, dropped the offending event and resynchronized, so
+                    // the connection is still healthy and memory is still bounded.
+                    // Tearing the subscription down by default would add no protection
+                    // and would hand any server a way to end a long-lived stream with a
+                    // single large event — hence the opt-in.
                     Some(Err(SseStreamError::PayloadTooLarge(err))) => {
-                        slf.close();
-                        return Poll::Ready(Some(Err(Error::PayloadTooLarge(err))));
+                        if slf.fail_on_oversized_event {
+                            // Every `Err` from this stream is terminal, so close before
+                            // yielding one: that drops the response body and keeps
+                            // `ready_state`/`is_terminated` consistent with the item.
+                            slf.close();
+                            return Poll::Ready(Some(Err(Error::PayloadTooLarge(err))));
+                        }
+                        return Poll::Ready(Some(Ok(SseEvent::Discarded(err))));
                     }
                     Some(Err(SseStreamError::Inner(err))) => {
                         return Poll::Ready(Some(slf.go_to_sleep(err.into())));
@@ -606,6 +758,64 @@ impl Stream for EventSource {
                 State::Closed => return Poll::Ready(None),
             }
         }
+    }
+}
+
+/// Returns whether a `Content-Type` header value names the `text/event-stream`
+/// media type.
+///
+/// Media types are case-insensitive (RFC 9110 §8.3.1), so `Text/Event-Stream` is
+/// just as valid as the lowercase spelling. Whatever follows the type must begin a
+/// parameter (`;charset=utf-8`) or be optional whitespace, so that near-misses like
+/// `text/event-streamx` are still rejected.
+fn is_event_stream(content_type: &[u8]) -> bool {
+    const MIME_EVENT_STREAM: &str = "text/event-stream";
+
+    let Some((essence, rest)) = content_type.split_at_checked(MIME_EVENT_STREAM.len()) else {
+        return false;
+    };
+
+    essence.eq_ignore_ascii_case(MIME_EVENT_STREAM.as_bytes())
+        && matches!(rest.first(), None | Some(b';' | b' ' | b'\t'))
+}
+
+#[test]
+fn test_is_event_stream() {
+    for ct in [
+        "text/event-stream",
+        "Text/Event-Stream",
+        "TEXT/EVENT-STREAM",
+        "text/event-stream;charset=utf-8",
+        "Text/Event-Stream; charset=utf-8",
+        "text/event-stream\tx",
+        "text/event-stream ",
+    ] {
+        assert!(is_event_stream(ct.as_bytes()), "rejected {ct:?}");
+    }
+
+    for ct in [
+        "",
+        "text/plain",
+        "text/event",
+        "text/event-strea",
+        "text/event-streamx",
+        "application/json",
+        " text/event-stream",
+    ] {
+        assert!(!is_event_stream(ct.as_bytes()), "accepted {ct:?}");
+    }
+}
+
+/// An [`EventSource`] is terminated exactly when it is [`ReadyState::Closed`], which
+/// is the only state in which [`poll_next`](Stream::poll_next) yields [`None`].
+///
+/// Note that termination is not permanent: like [`SseStream`], a closed
+/// [`EventSource`] can be revived with
+/// [`force_reconnect()`](EventSource::force_reconnect).
+impl FusedStream for EventSource {
+    #[inline]
+    fn is_terminated(&self) -> bool {
+        matches!(self.state, State::Closed)
     }
 }
 
@@ -628,5 +838,136 @@ impl RequestBuilderExt for RequestBuilder {
     }
     fn into_event_source_builder(self) -> EventSourceBuilder {
         EventSourceBuilder::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    use super::*;
+
+    /// Serves `response` once over a raw socket, then closes. The returned handle
+    /// must be joined so the test doesn't outlive its own server thread.
+    fn serve(response: String) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let _ = sock.read(&mut [0u8; 4096]);
+            let _ = sock.write_all(response.as_bytes());
+            let _ = sock.flush();
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// The response used by both oversized-event tests: a deliverable event, one
+    /// that blows past the limit, then another deliverable one.
+    fn serve_oversized_event() -> (String, std::thread::JoinHandle<()>) {
+        serve(format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/event-stream\r\n\
+             Connection: close\r\n\r\n\
+             id: 1\ndata: before\n\n\
+             id: 2\ndata: {}\n\n\
+             id: 3\ndata: after\n\n",
+            "x".repeat(64),
+        ))
+    }
+
+    /// An oversized event must not take the connection down with it: the events
+    /// around it still arrive, in order, on the very same connection.
+    #[tokio::test]
+    async fn oversized_event_is_discarded_without_dropping_the_connection() {
+        use futures_util::StreamExt;
+
+        let (url, server) = serve_oversized_event();
+
+        let mut es = reqwest::Client::new()
+            .get(&url)
+            .into_event_source_builder()
+            .max_payload_size(NonZeroUsize::new(16).unwrap())
+            .build();
+
+        let mut seen = vec![];
+        let mut id_at_discard = None;
+        while let Some(event) = es.next().await {
+            match event.unwrap() {
+                SseEvent::Open => seen.push("open".to_owned()),
+                SseEvent::Message(msg) => seen.push(format!("msg:{}", msg.data)),
+                SseEvent::Discarded(_) => {
+                    seen.push("discarded".to_owned());
+                    id_at_discard = es.last_event_id().map(|id| id.to_string());
+                }
+                // Reached once the server hangs up; stop before it reconnects.
+                SseEvent::Error(_) => break,
+            }
+        }
+
+        assert_eq!(seen, ["open", "msg:before", "discarded", "msg:after"]);
+
+        // The discarded event's own `id: 2` is rolled back rather than committed, so
+        // at that moment the resume point is still the last *delivered* event. This
+        // is precisely why `SseEvent::Discarded` documents that reconnecting can spin:
+        // a replaying server would rewind to 1 and resend the oversized event forever.
+        assert_eq!(id_at_discard.as_deref(), Some("1"));
+
+        // Parsing resynchronizes, so the following event commits its ID normally.
+        assert_eq!(es.last_event_id().map(|id| &**id), Some("3"));
+
+        // Backing off, not terminated: only `close()` (or an `Err`) ends the stream.
+        assert!(!es.is_terminated());
+        es.close();
+        assert!(es.is_terminated());
+
+        server.join().unwrap();
+    }
+
+    /// With `fail_on_oversized_event`, the same stream stops at the oversized event
+    /// instead of resynchronizing past it — and stops *properly*, closing itself so
+    /// the terminal `Err` doesn't leave an `Open` stream behind it.
+    #[tokio::test]
+    async fn oversized_event_is_fatal_when_opted_in() {
+        use futures_util::StreamExt;
+
+        let (url, server) = serve_oversized_event();
+
+        let mut es = reqwest::Client::new()
+            .get(&url)
+            .into_event_source_builder()
+            .max_payload_size(NonZeroUsize::new(16).unwrap())
+            .fail_on_oversized_event(true)
+            .build();
+
+        let mut seen = vec![];
+        let err = loop {
+            match es.next().await.expect("stream ended without an error") {
+                Ok(SseEvent::Open) => seen.push("open".to_owned()),
+                Ok(SseEvent::Message(msg)) => seen.push(format!("msg:{}", msg.data)),
+                Ok(SseEvent::Discarded(_)) => panic!("Discarded is not emitted when opted in"),
+                Ok(SseEvent::Error(err)) => panic!("unexpected connection error: {err}"),
+                Err(err) => break err,
+            }
+        };
+
+        // `id: 3` is never reached: the stream stops at the oversized event rather
+        // than resynchronizing to the one after it.
+        assert_eq!(seen, ["open", "msg:before"]);
+        assert!(matches!(err, Error::PayloadTooLarge(_)), "got {err:?}");
+
+        // The `Err` is genuinely terminal — this is what a caller-side `map` over
+        // `SseEvent::Discarded` cannot do, since it can't close the `EventSource`.
+        assert!(es.is_terminated());
+        assert_eq!(es.ready_state(), ReadyState::Closed);
+        assert!(es.next().await.is_none());
+
+        // The resume point is still the last *delivered* event, so reconnecting
+        // as-is would replay the oversized event forever. Recovery means rebuilding
+        // with a larger limit from this ID, per `fail_on_oversized_event`'s docs.
+        assert_eq!(es.last_event_id().map(|id| &**id), Some("1"));
+
+        server.join().unwrap();
     }
 }

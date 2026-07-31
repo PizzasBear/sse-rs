@@ -36,8 +36,8 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sse-reqwest-client = "0.3"
-reqwest = { version = "0.12", features = ["stream"] }
+sse-reqwest-client = "0.4"
+reqwest = { version = "0.13", features = ["stream"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3"
 ```
@@ -45,7 +45,7 @@ futures-util = "0.3"
 And connect using the extension trait:
 
 ```rust
-use sse_reqwest_client::RequestBuilderExt;
+use sse_reqwest_client::{RequestBuilderExt, SseEvent};
 use futures_util::StreamExt;
 
 #[tokio::main]
@@ -61,13 +61,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(event) = stream.next().await {
         match event? {
-            sse_reqwest_client::Event::Open => println!("Connection established!"),
-            sse_reqwest_client::Event::Message(msg) => {
+            SseEvent::Open => println!("Connection established!"),
+            SseEvent::Message(msg) => {
                 println!("Received event: {}", msg.event);
                 println!("Payload: {}", msg.data);
             }
-            sse_reqwest_client::Event::Error(err) => {
+            SseEvent::Error(err) => {
                 eprintln!("Connection dropped, attempting to reconnect: {}", err);
+            }
+            SseEvent::Discarded(err) => {
+                eprintln!("Skipped an oversized event: {}", err);
             }
         }
     }
